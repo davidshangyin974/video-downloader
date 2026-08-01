@@ -1,0 +1,44 @@
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Node.js and frontend builds
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Runtime data and downloaded media
+/data/
+/undefined/
+*.log
+*.pid
+
+# Generated build and test artifacts
+/.build/
+/dist/
+/output/
+/.playwright-cli/
+/design-qa.md
+/frontend/design-qa-current*.png
