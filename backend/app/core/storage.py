@@ -96,6 +96,7 @@ def initialize_database() -> None:
                 parent_output_index INTEGER,
                 restart_pending INTEGER NOT NULL DEFAULT 0,
                 priority INTEGER NOT NULL DEFAULT 0,
+                upgrade_from_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -127,6 +128,7 @@ def initialize_database() -> None:
             "parent_output_index": "INTEGER",
             "restart_pending": "INTEGER NOT NULL DEFAULT 0",
             "priority": "INTEGER NOT NULL DEFAULT 0",
+            "upgrade_from_id": "TEXT",
         }
         for name, definition in additions.items():
             if name not in columns:
@@ -208,6 +210,42 @@ def initialize_database() -> None:
         denoise_columns = {row["name"] for row in database.execute("PRAGMA table_info(video_denoise_jobs)")}
         if "filter_config" not in denoise_columns:
             database.execute("ALTER TABLE video_denoise_jobs ADD COLUMN filter_config TEXT")
+        database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_follows (
+                id TEXT PRIMARY KEY,
+                source_url TEXT NOT NULL UNIQUE,
+                source_platform TEXT,
+                title TEXT NOT NULL,
+                uploader TEXT,
+                thumbnail TEXT,
+                external_id TEXT,
+                check_on_startup INTEGER NOT NULL DEFAULT 1,
+                last_checked_at TEXT,
+                last_error TEXT,
+                entries_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_derivative_jobs (
+                id TEXT PRIMARY KEY,
+                download_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                file_path TEXT,
+                file_size INTEGER,
+                library_video_id TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(download_id) REFERENCES downloads(id)
+            )
+            """
+        )
         database.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         for key, value in DEFAULT_DOWNLOAD_SETTINGS.items():
             database.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)", (key, json.dumps(value)))
@@ -232,5 +270,9 @@ def initialize_database() -> None:
         )
         database.execute(
             "UPDATE video_denoise_jobs SET status = 'interrupted', error = '应用关闭，处理已停止。', updated_at = ? WHERE status IN ('queued', 'running')",
+            (now(),),
+        )
+        database.execute(
+            "UPDATE media_derivative_jobs SET status = 'interrupted', error = '应用关闭，处理已停止。', updated_at = ? WHERE status IN ('queued', 'running')",
             (now(),),
         )

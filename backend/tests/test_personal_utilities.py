@@ -141,6 +141,29 @@ class PersonalUtilityTests(unittest.TestCase):
         move.assert_called_once_with(part_file.resolve())
         self.assertEqual(result["freed_bytes"], len(b"partial"))
 
+    def test_incomplete_preview_never_exposes_active_or_paused_task_files(self) -> None:
+        download_root = self.root / "downloads"
+        active_dir = download_root / "active"
+        paused_dir = download_root / "paused"
+        active_dir.mkdir(parents=True)
+        paused_dir.mkdir()
+        failed_part = download_root / "failed.mp4.part"
+        active_part = active_dir / "active.mp4.part"
+        paused_part = paused_dir / "paused.mp4.part"
+        failed_part.write_bytes(b"failed")
+        active_part.write_bytes(b"active")
+        paused_part.write_bytes(b"paused")
+        timestamp = datetime.now(UTC).isoformat()
+        self.insert_download("failed-task", "failed", timestamp, download_dir=download_root)
+        self.insert_download("active-task", "running", timestamp, download_dir=active_dir)
+        self.insert_download("paused-task", "paused", timestamp, download_dir=paused_dir)
+
+        preview_paths = {item["path"] for item in server.incomplete_residue_preview()["items"]}
+
+        self.assertIn(str(failed_part.resolve()), preview_paths)
+        self.assertNotIn(str(active_part.resolve()), preview_paths)
+        self.assertNotIn(str(paused_part.resolve()), preview_paths)
+
     def test_video_title_can_rename_media_and_related_sidecars(self) -> None:
         media_dir = self.root / "media"
         media_dir.mkdir()
@@ -179,6 +202,22 @@ class PersonalUtilityTests(unittest.TestCase):
             result = server.check_ytdlp_update(force=True)
         self.assertTrue(result["update_available"])
         self.assertEqual(result["latest_version"], "9999.1.1")
+
+    def test_health_reports_application_and_open_source_component_versions(self) -> None:
+        with (
+            patch("app.server.get_download_settings", return_value={"qbittorrent": {"enabled": False}}),
+            patch("app.server.ffmpeg_version", return_value="8.1.2"),
+            patch("app.server.aria2.executable", return_value="/usr/bin/aria2c"),
+            patch("app.server.aria2.version", return_value="1.37.0"),
+            patch("app.server.package_version", side_effect=lambda name: {"fastapi": "0.141.1", "uvicorn": "0.52.0"}[name]),
+        ):
+            result = server.health()
+
+        self.assertEqual(result["application"]["version"], "0.1.0")
+        self.assertEqual(result["application"]["fastapi_version"], "0.141.1")
+        self.assertEqual(result["application"]["uvicorn_version"], "0.52.0")
+        self.assertEqual(result["ffmpeg_version"], "8.1.2")
+        self.assertEqual(result["engines"]["aria2"]["version"], "1.37.0")
 
     def test_system_notification_respects_setting_and_uses_argv(self) -> None:
         completed = Mock(returncode=0)

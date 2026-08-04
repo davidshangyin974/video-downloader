@@ -6,13 +6,13 @@ import base64
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 
 from app import server
 from app.core import storage
 from app.core.models import DownloadRequest, InspectRequest, QbittorrentSettings
 from app.engines import qbittorrent
-from app.engines.inputs import InputError, route_input
+from app.engines.inputs import InputError, MAX_TORRENT_FILES, inspect_torrent, route_input
 from app.services.engine_tasks import run_qbittorrent_task
 
 
@@ -191,6 +191,42 @@ class QbittorrentServerTests(unittest.TestCase):
         self.addCleanup(self.database_patch.stop)
         storage.initialize_database()
 
+    def test_qbittorrent_inspection_returns_the_complete_bounded_file_list(self) -> None:
+        fake = FakeQbittorrentClient()
+        fake.files = lambda _torrent_hash: [
+            {"index": index, "name": f"folder/video-{index}.mp4", "size": index + 1}
+            for index in range(101)
+        ]
+        source = {
+            "url": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "route": {
+                "engine": "qbittorrent",
+                "source_type": "magnet",
+                "resolved_url": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            },
+        }
+        with (
+            patch.object(server, "DATA_DIR", self.root),
+            patch("app.server.get_download_settings", return_value={"qbittorrent": {"enabled": True, "bt_stall_timeout": 30}}),
+            patch("app.server.qbittorrent_client", return_value=fake),
+        ):
+            inspected = server.inspect_source(source)
+        self.assertEqual(inspected["file_count"], 101)
+        self.assertEqual(len(inspected["files"]), 101)
+
+        fake = FakeQbittorrentClient()
+        fake.files = lambda _torrent_hash: [
+            {"index": index, "name": f"video-{index}.mp4", "size": 1}
+            for index in range(MAX_TORRENT_FILES + 1)
+        ]
+        with (
+            patch.object(server, "DATA_DIR", self.root),
+            patch("app.server.get_download_settings", return_value={"qbittorrent": {"enabled": True, "bt_stall_timeout": 30}}),
+            patch("app.server.qbittorrent_client", return_value=fake),
+            self.assertRaisesRegex(qbittorrent.QbittorrentError, str(MAX_TORRENT_FILES)),
+        ):
+            server.inspect_source(source)
+
     def test_enabled_qbittorrent_becomes_auto_bt_route_and_can_create_task(self) -> None:
         fake = FakeQbittorrentClient()
         qbit_settings = QbittorrentSettings(
@@ -244,6 +280,74 @@ class QbittorrentServerTests(unittest.TestCase):
         self.assertIs(task, run_qbittorrent_task)
         self.assertEqual(args[4], [0])
         self.assertEqual(args[6]["base_url"], "http://127.0.0.1:8080")
+
+    def test_info_hash_blocks_same_completed_selection_from_a_different_link(self) -> None:
+        torrent_data = (
+            b"d4:infod6:lengthi8e4:name9:movie.mp412:piece lengthi16384e"
+            b"6:pieces20:00000000000000000000ee"
+        )
+        info_hash = str(inspect_torrent(torrent_data, "movie.torrent")["info_hash"])
+        completed_file = self.root / "downloads" / "movie.mp4"
+        completed_file.parent.mkdir(parents=True)
+        completed_file.write_bytes(b"complete")
+        server.insert_engine_download(
+            "completed-bt",
+            "aria2",
+            "1.37.0",
+            "magnet:?xt=urn:btih:1111111111111111111111111111111111111111",
+            "BT 下载",
+            "magnet",
+            "magnet:?xt=urn:btih:1111111111111111111111111111111111111111",
+            str(self.root / "downloads"),
+            "movie.mp4",
+            8,
+            engine_metadata={"bt_info_hash": info_hash, "selected_file_indexes": [0]},
+        )
+        with server.connection() as database:
+            database.execute(
+                "UPDATE downloads SET status = 'completed', file_path = ?, library_visible = 1 WHERE id = ?",
+                (str(completed_file), "completed-bt"),
+            )
+        self.assertEqual(
+            server.matching_bt_download_ids(
+                info_hash,
+                [1],
+                ("completed",),
+                require_completed_output=True,
+            ),
+            [],
+        )
+
+        inspect_id = "same-info-hash"
+        source = {
+            "url": f"magnet:?xt=urn:btih:{info_hash}&dn=another-name",
+            "route": route_input(f"magnet:?xt=urn:btih:{info_hash}&dn=another-name"),
+            "torrent_data": torrent_data,
+            "torrent_name": "another.torrent",
+            "bt_info_hash": info_hash,
+        }
+        server.inspect_jobs[inspect_id] = {
+            "status": "completed",
+            "source": source,
+            "media": {
+                "kind": "torrent",
+                "title": "movie.mp4",
+                "engine": "aria2",
+                "source_type": "magnet",
+                "info_hash": info_hash,
+                "files": [{"index": 0, "path": "movie.mp4", "size": 8}],
+            },
+        }
+        self.addCleanup(server.inspect_jobs.pop, inspect_id, None)
+        with self.assertRaisesRegex(HTTPException, "这个视频已下载"):
+            server.create_download(
+                DownloadRequest(
+                    inspect_id=inspect_id,
+                    selected_file_indexes=[0],
+                    download_dir=str(self.root / "new-downloads"),
+                ),
+                BackgroundTasks(),
+            )
 
 
 if __name__ == "__main__":

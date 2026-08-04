@@ -102,6 +102,100 @@ class PersonalLibraryTests(unittest.TestCase):
         self.assertEqual(reset["watched"], 0)
         self.assertEqual(reset["watch_position"], 0)
 
+    def test_playback_progress_does_not_clear_explicit_watched_state(self) -> None:
+        self.insert_video("watched-video", watched=1, watch_position=100)
+
+        progress = server.update_video_progress(
+            "watched-video", PlaybackProgressRequest(position=5, duration=100)
+        )
+
+        self.assertEqual(progress["watch_position"], 5)
+        self.assertEqual(progress["watched"], 1)
+
+    def test_continue_watching_and_next_episode_are_derived_from_watch_state(self) -> None:
+        with storage.connection() as database:
+            database.execute(
+                """
+                INSERT INTO playlists (
+                    id, source_url, source_platform, title, total_count,
+                    source_total_count, created_at, updated_at
+                ) VALUES ('course', 'https://example.com/course', 'Example',
+                          '个人课程', 3, 3, '2026-07-31T00:00:00+00:00',
+                          '2026-07-31T00:00:00+00:00')
+                """
+            )
+        self.insert_video(
+            "standalone-progress",
+            watch_position=35,
+            watched=0,
+            last_watched_at="2026-08-02T02:00:00+00:00",
+        )
+        self.insert_video(
+            "course-1",
+            playlist_id="course",
+            playlist_index=1,
+            watch_position=100,
+            watched=1,
+            last_watched_at="2026-08-02T01:00:00+00:00",
+        )
+        self.insert_video(
+            "course-2",
+            playlist_id="course",
+            playlist_index=2,
+            watch_position=0,
+            watched=0,
+        )
+        self.insert_video(
+            "course-3",
+            playlist_id="course",
+            playlist_index=3,
+            watch_position=0,
+            watched=0,
+        )
+
+        result = server.continue_watching_items()
+
+        self.assertEqual(
+            [item["video"]["id"] for item in result["continuing"]],
+            ["standalone-progress"],
+        )
+        self.assertEqual(
+            [item["video"]["id"] for item in result["next_up"]],
+            ["course-2"],
+        )
+        self.assertEqual(result["next_up"][0]["playlist_title"], "个人课程")
+
+    def test_unfinished_playlist_episode_does_not_surface_the_following_episode(self) -> None:
+        with storage.connection() as database:
+            database.execute(
+                """
+                INSERT INTO playlists (
+                    id, source_url, source_platform, title, total_count,
+                    source_total_count, created_at, updated_at
+                ) VALUES ('series', 'https://example.com/series', 'Example',
+                          '连续剧', 2, 2, '2026-07-31T00:00:00+00:00',
+                          '2026-07-31T00:00:00+00:00')
+                """
+            )
+        self.insert_video(
+            "series-1",
+            playlist_id="series",
+            playlist_index=1,
+            watch_position=40,
+            watched=0,
+            last_watched_at="2026-08-02T02:00:00+00:00",
+        )
+        self.insert_video(
+            "series-2",
+            playlist_id="series",
+            playlist_index=2,
+        )
+
+        result = server.continue_watching_items()
+
+        self.assertEqual([item["video"]["id"] for item in result["continuing"]], ["series-1"])
+        self.assertEqual(result["next_up"], [])
+
     def test_library_can_filter_sort_and_paginate(self) -> None:
         self.insert_video(
             "charlie", title="Charlie", file_size=30, favorite=1,

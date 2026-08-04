@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -36,6 +37,21 @@ class FakeProcess:
 
 
 class Aria2AdapterEdgeTests(unittest.TestCase):
+    def test_exit_codes_produce_actionable_download_errors(self) -> None:
+        for code, message in (
+            (6, "网络连接失败"),
+            (9, "磁盘可用空间不足"),
+            (19, "域名解析失败"),
+            (24, "登录或鉴权"),
+            (25, "种子文件格式无效"),
+            (27, "磁力链接格式无效"),
+            (32, "校验失败"),
+        ):
+            with self.subTest(code=code):
+                self.assertIn(message, aria2.failure_message(code, bt=True))
+        self.assertIn("没有获得数据", aria2.failure_message(1, bt=True, stall_timeout=45))
+        self.assertIn("错误码 1", aria2.failure_message(1))
+
     def test_executable_and_version_cover_missing_errors_and_output(self) -> None:
         with patch("app.engines.aria2.shutil.which", return_value=None):
             self.assertIsNone(aria2.executable())
@@ -128,6 +144,21 @@ class Aria2AdapterEdgeTests(unittest.TestCase):
             (private / "source.torrent").write_bytes(b"torrent")
             self.assertEqual(aria2._managed_files(root), [root / "movie.mp4"])
 
+    def test_dht_state_is_copied_per_task_and_promoted_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            shared = root / "shared" / "dht.dat"
+            shared.parent.mkdir()
+            shared.write_bytes(b"old-state")
+            task_state = aria2._prepare_dht_state(str(shared), root / "task")
+            self.assertIsNotNone(task_state)
+            assert task_state is not None
+            self.assertEqual(task_state.read_bytes(), b"old-state")
+
+            task_state.write_bytes(b"new-state")
+            aria2._promote_dht_state(task_state, str(shared))
+            self.assertEqual(shared.read_bytes(), b"new-state")
+
     def test_bt_download_errors_and_cancellation(self) -> None:
         callback = lambda *_args: None
         with patch("app.engines.aria2.executable", return_value=None):
@@ -171,7 +202,11 @@ class Aria2AdapterEdgeTests(unittest.TestCase):
                     with self.assertRaisesRegex(aria2.Aria2Error, message):
                         aria2.download_bt("magnet:?x", temporary_directory, None, None, lambda: False, callback, callback)
 
-    def test_fetch_magnet_metadata_covers_all_terminal_results(self) -> None:
+    @patch(
+        "app.engines.aria2.resolve_dht_bootstrap",
+        return_value=("dht.example", 6881, ("203.0.113.10",)),
+    )
+    def test_fetch_magnet_metadata_covers_all_terminal_results(self, _resolve_dht: MagicMock) -> None:
         with patch("app.engines.aria2.executable", return_value=None):
             with self.assertRaisesRegex(aria2.Aria2Error, "未找到"):
                 aria2.fetch_magnet_metadata("magnet:?x")
@@ -201,6 +236,32 @@ class Aria2AdapterEdgeTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(aria2.Aria2Error, message):
                     aria2.fetch_magnet_metadata("magnet:?x")
+
+    def test_dht_bootstrap_rejects_proxy_fake_ip_before_starting_aria2(self) -> None:
+        answer = (socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("198.18.0.122", 6881))
+        with (
+            patch("app.engines.aria2.socket.getaddrinfo", return_value=[answer]),
+            self.assertRaisesRegex(aria2.Aria2Error, "Fake-IP"),
+        ):
+            aria2.resolve_dht_bootstrap()
+
+    def test_magnet_metadata_reports_malformed_dht_response(self) -> None:
+        with (
+            patch("app.engines.aria2.executable", return_value="aria2c"),
+            patch(
+                "app.engines.aria2.resolve_dht_bootstrap",
+                return_value=("dht.example", 6881, ("203.0.113.10",)),
+            ),
+            patch(
+                "app.engines.aria2.subprocess.run",
+                return_value=MagicMock(
+                    returncode=1,
+                    stderr="Malformed DHT message. Missing token",
+                ),
+            ),
+            self.assertRaisesRegex(aria2.Aria2Error, "无效响应"),
+        ):
+            aria2.fetch_magnet_metadata("magnet:?x")
 
 
 class QbittorrentAdapterEdgeTests(unittest.TestCase):

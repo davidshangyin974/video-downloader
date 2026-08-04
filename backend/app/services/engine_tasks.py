@@ -36,7 +36,7 @@ def run_aria2_task(
     publish_task: PublishTask,
     is_cancelled: IsCancelled,
     register_process: RegisterProcess,
-    aria2_settings: dict[str, int] | None = None,
+    aria2_settings: dict[str, Any] | None = None,
     register_media_outputs: RegisterMediaOutputs | None = None,
     is_paused: IsPaused | None = None,
     is_interrupted: IsInterrupted | None = None,
@@ -51,16 +51,24 @@ def run_aria2_task(
     retry_wait = int(aria2_settings.get("retry_wait", 2))
     bt_stall_timeout = int(aria2_settings.get("bt_stall_timeout", aria2.BT_STALL_TIMEOUT_SECONDS))
     download_rate_limit_kbps = int(aria2_settings.get("download_rate_limit_kbps", 0))
+    dht_state_path = str(aria2_settings.get("dht_state_path") or "") or None
     update_task(download_id, status="running", error=None, restart_pending=0)
     task_label = "BT" if source_type in {"magnet", "torrent_url", "torrent_file", "thunder_bt"} else "直链"
     download_root = Path(download_dir).resolve()
     task_output_dir = download_root / "BT" / download_id if task_label == "BT" else download_root
+    has_resume_state = (
+        task_output_dir.exists() and any(task_output_dir.rglob("*.aria2"))
+        if task_label == "BT"
+        else bool(file_name and (task_output_dir / f"{file_name}.aria2").is_file())
+    )
     append_log(download_id, "info", f"aria2 已启动，正在建立{task_label}断点续传下载。")
-    if task_label == "BT":
+    if has_resume_state:
+        append_log(download_id, "info", "发现上次保留的未完成数据，正在校验断点并继续下载。")
+    elif task_label == "BT":
         append_log(
             download_id,
             "info",
-            f"正在连接 BT 节点。若 {bt_stall_timeout} 秒内没有获得数据，任务会停止并提示重试。",
+            f"BT 文件清单已就绪，正在连接节点。若 {bt_stall_timeout} 秒内没有获得数据，任务会停止并提示重试。",
         )
     publish_task(download_id)
 
@@ -118,13 +126,13 @@ def run_aria2_task(
             files = aria2.download_bt(
                 str(source_path), str(task_output_dir), expected_size, selected_file_indexes, should_stop,
                 lambda process: register_process(download_id, process), on_progress, bt_stall_timeout,
-                download_rate_limit_kbps,
+                download_rate_limit_kbps, dht_state_path,
             )
         elif source_type in {"magnet", "torrent_url", "thunder_bt"}:
             files = aria2.download_bt(
                 source_url, str(task_output_dir), expected_size, selected_file_indexes, should_stop,
                 lambda process: register_process(download_id, process), on_progress, bt_stall_timeout,
-                download_rate_limit_kbps,
+                download_rate_limit_kbps, dht_state_path,
             )
         else:
             if not file_name:
@@ -162,7 +170,7 @@ def run_aria2_task(
             error=None,
             restart_pending=0,
         )
-        if register_media_outputs is not None and len(media_files) > 1:
+        if register_media_outputs is not None and media_files:
             try:
                 register_media_outputs(download_id)
             except Exception as error:
@@ -385,8 +393,11 @@ def run_qbittorrent_task(
             error=None,
             restart_pending=0,
         )
-        if register_media_outputs is not None and len(media_files) > 1:
-            register_media_outputs(download_id)
+        if register_media_outputs is not None and media_files:
+            try:
+                register_media_outputs(download_id)
+            except Exception as error:
+                append_log(download_id, "warning", f"媒体文件已下载，但补充媒体信息时失败：{error}")
         client.delete(torrent_hash, delete_files=False)
         append_log(download_id, "info", "qBittorrent BT 下载完成，输出文件已加入本地媒体库。")
     except qbittorrent.QbittorrentError as error:

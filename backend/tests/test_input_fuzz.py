@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import unittest
 from email.message import Message
 from urllib.error import URLError
@@ -11,16 +12,19 @@ from hypothesis import given, settings, strategies as st
 
 from app.engines.inputs import (
     InputError,
+    MAX_TORRENT_FILES,
     _decode_torrent_value,
     _parse_bencode,
     decode_thunder_url,
     direct_file_name,
     direct_file_probe,
+    fetch_torrent_url,
     inspect_non_ytdlp_input,
     inspect_torrent,
     is_direct_file_url,
     is_media_file,
     is_torrent_url,
+    magnet_info_hash,
     route_input,
 )
 
@@ -142,6 +146,35 @@ class InputEdgeCaseTests(unittest.TestCase):
             result = direct_file_probe("https://example.com/offline.mp4")
         self.assertEqual(result, {"file_name": "offline.mp4", "file_size": None, "content_type": None})
 
+    def test_remote_torrent_fetch_is_bounded_and_keeps_final_name(self) -> None:
+        headers = Message()
+        headers["Content-Length"] = "7"
+        response = MagicMock()
+        response.headers = headers
+        response.read.return_value = b"torrent"
+        response.geturl.return_value = "https://cdn.example.com/final.torrent"
+        response.__enter__.return_value = response
+        with patch("app.engines.inputs.urlopen", return_value=response):
+            payload, name = fetch_torrent_url("https://example.com/source.torrent", max_bytes=16)
+        self.assertEqual(payload, b"torrent")
+        self.assertEqual(name, "final.torrent")
+        response.read.assert_called_once_with(17)
+
+        headers.replace_header("Content-Length", "17")
+        with (
+            patch("app.engines.inputs.urlopen", return_value=response),
+            self.assertRaisesRegex(InputError, "超过"),
+        ):
+            fetch_torrent_url("https://example.com/source.torrent", max_bytes=16)
+
+        headers.replace_header("Content-Length", "unknown")
+        response.read.return_value = b"x" * 17
+        with (
+            patch("app.engines.inputs.urlopen", return_value=response),
+            self.assertRaisesRegex(InputError, "超过"),
+        ):
+            fetch_torrent_url("https://example.com/source.torrent", max_bytes=16)
+
     def test_bencode_parser_and_torrent_inspection_cover_valid_shapes(self) -> None:
         self.assertEqual(_parse_bencode(b"i42e"), (42, 4))
         self.assertEqual(_parse_bencode(b"l1:ai2ee"), ([b"a", 2], 8))
@@ -155,6 +188,17 @@ class InputEdgeCaseTests(unittest.TestCase):
         self.assertEqual(inspected["title"], "movie.mp4")
         self.assertEqual(inspected["file_size"], 123)
         self.assertEqual(inspected["files"], [{"index": 0, "path": "movie.mp4", "size": 123}])
+        self.assertEqual(
+            inspected["info_hash"],
+            hashlib.sha1(bencode({b"length": 123, b"name": b"movie.mp4"})).hexdigest(),
+        )
+        self.assertEqual(
+            magnet_info_hash(f"magnet:?xt=urn:btih:{inspected['info_hash'].upper()}"),
+            inspected["info_hash"],
+        )
+        base32_hash = base64.b32encode(bytes.fromhex(inspected["info_hash"])).decode()
+        self.assertEqual(magnet_info_hash(f"magnet:?xt=urn:btih:{base32_hash}"), inspected["info_hash"])
+        self.assertIsNone(magnet_info_hash("magnet:?xt=urn:sha1:abcdef"))
 
         multi = bencode(
             {
@@ -173,6 +217,22 @@ class InputEdgeCaseTests(unittest.TestCase):
         self.assertEqual(inspected["file_count"], 2)
         self.assertEqual(inspected["file_size"], 10)
         self.assertEqual(inspected["files"][0]["path"], "video/one.mp4")
+
+    def test_torrent_file_list_is_not_silently_truncated(self) -> None:
+        files = [
+            {b"length": index + 1, b"path": [f"video-{index}.mp4".encode()]}
+            for index in range(101)
+        ]
+        inspected = inspect_torrent(bencode({b"info": {b"name": b"collection", b"files": files}}), None)
+        self.assertEqual(inspected["file_count"], 101)
+        self.assertEqual(len(inspected["files"]), 101)
+
+        too_many = [
+            {b"length": 1, b"path": [f"video-{index}.mp4".encode()]}
+            for index in range(MAX_TORRENT_FILES + 1)
+        ]
+        with self.assertRaisesRegex(InputError, str(MAX_TORRENT_FILES)):
+            inspect_torrent(bencode({b"info": {b"name": b"collection", b"files": too_many}}), None)
 
     def test_bencode_parser_rejects_each_invalid_shape(self) -> None:
         invalid_payloads = (

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
@@ -66,6 +67,21 @@ class TwoPartFakeDownloader(FakeDownloader):
 
 
 class TaskStateTests(unittest.TestCase):
+    def test_audio_extraction_keeps_ytdlp_bestaudio_format(self) -> None:
+        options = server.build_ytdlp_download_options(
+            "--extract-audio\n--audio-format mp3",
+            "137+bestaudio/best",
+            "/tmp",
+            False,
+            False,
+            "",
+            lambda _progress: None,
+            Mock(),
+        )
+
+        self.assertEqual(options["format"], "bestaudio/best")
+        self.assertTrue(any(item.get("key") == "FFmpegExtractAudio" for item in options["postprocessors"]))
+
     def test_download_scheduler_runs_higher_priority_waiting_task_first(self) -> None:
         release = threading.Event()
         first_started = threading.Event()
@@ -225,6 +241,38 @@ class TaskStateTests(unittest.TestCase):
         self.assertEqual(completed["total_bytes"], len(b"final-video"))
         self.assertIsNone(completed["speed"])
         self.assertIsNone(completed["eta"])
+
+    def test_completed_audio_download_uses_actual_file_metadata(self) -> None:
+        updates: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "audio.mp3"
+            output_path.write_bytes(b"final-audio")
+            with (
+                patch("app.server.build_ytdlp_download_options", return_value={}),
+                patch("app.server.yt_dlp.YoutubeDL", return_value=FakeDownloader(output_path)),
+                patch("app.server.probe_local_media_file", return_value={
+                    "media_type": "audio",
+                    "duration": 120.0,
+                    "resolution": None,
+                    "codec": "mp3",
+                    "bit_rate": 192_000,
+                    "format_name": "mp3",
+                }),
+                patch("app.server.update_download", side_effect=lambda _id, **values: updates.append(values)),
+                patch("app.server.append_log"),
+                patch("app.server.publish_download"),
+            ):
+                server.run_download(
+                    "audio-test", "https://example.com/video", None, temp_dir,
+                    False, False, "", "",
+                )
+
+        completed = updates[-1]
+        metadata = json.loads(str(completed["metadata_json"]))
+        self.assertEqual(metadata["media_type"], "audio")
+        self.assertEqual(metadata["bit_rate"], 192_000)
+        self.assertEqual(completed["duration"], 120.0)
+        self.assertIsNone(completed["resolution"])
 
     def test_multi_part_ytdlp_progress_is_one_monotonic_total(self) -> None:
         updates: list[dict[str, object]] = []

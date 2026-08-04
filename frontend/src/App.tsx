@@ -1,17 +1,28 @@
-import { FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 // Plyr's package exports a default ESM build but declares CommonJS types.
 // @ts-expect-error The Vite runtime resolves the default ESM export.
 import Plyr from 'plyr'
 import 'plyr/dist/plyr.css'
-import WaveSurfer from 'wavesurfer.js'
+import type WaveSurfer from 'wavesurfer.js'
 import videoPlaceholder from './assets/video-placeholder.webp'
 
 const torrentMediaExtensions = new Set(['.3gp', '.aac', '.alac', '.avi', '.flac', '.m4a', '.m4v', '.mka', '.mkv', '.mov', '.mp3', '.mp4', '.mpeg', '.mpg', '.ogg', '.ogv', '.opus', '.wav', '.webm', '.wma'])
 const audioMediaExtensions = new Set(['.aac', '.alac', '.flac', '.m4a', '.mka', '.mp3', '.ogg', '.opus', '.wav', '.wma'])
+const torrentVisibleFileStep = 200
 
 function isTorrentMediaFile(path: string) {
   const extensionStart = path.lastIndexOf('.')
   return extensionStart >= 0 && torrentMediaExtensions.has(path.slice(extensionStart).toLowerCase())
+}
+
+function torrentFolderLabel(path: string) {
+  const parts = path.split('/').filter(Boolean)
+  return parts.length > 1 ? parts[0] : '根目录'
+}
+
+function torrentFileLabel(path: string, folder: string) {
+  const prefix = folder === '根目录' ? '' : `${folder}/`
+  return prefix && path.startsWith(prefix) ? path.slice(prefix.length) : path
 }
 
 type Health = {
@@ -20,6 +31,11 @@ type Health = {
   engine_version: string
   ffmpeg_available: boolean
   ffmpeg_version: string | null
+  application?: {
+    version: string
+    fastapi_version: string
+    uvicorn_version: string
+  }
   engines?: {
     'yt-dlp': { available: boolean, version: string }
     aria2: { available: boolean, version: string | null }
@@ -30,7 +46,19 @@ type Health = {
 type DownloadFormat = {
   format_id: string
   label: string
+  resolution: string | null
+  extension: string | null
+  file_size: number | null
   file_size_label: string | null
+  fps: number | null
+}
+
+type VideoUpgradeOptions = {
+  download_id: string
+  source_url: string
+  current_resolution: string | null
+  current_height: number | null
+  candidates: Array<DownloadFormat & { height: number }>
 }
 
 type InspectedVideo = {
@@ -65,6 +93,21 @@ type InspectedPlaylist = {
   entry_count: number
   source_total_count: number
   entries: InspectedPlaylistEntry[]
+}
+
+type SourceFollow = {
+  id: string
+  source_url: string
+  source_platform: string | null
+  title: string
+  uploader: string | null
+  thumbnail: string | null
+  external_id: string | null
+  check_on_startup: boolean
+  last_checked_at: string | null
+  last_error: string | null
+  entries: InspectedPlaylistEntry[]
+  new_count: number
 }
 
 type InspectedFile = {
@@ -181,6 +224,7 @@ type Download = {
   created_at: string
   file_exists: boolean
   file_origin: 'downloaded' | 'local'
+  upgrade_from_id: string | null
   metadata?: {
     chapters?: Array<{ title: string | null; start_time: number | null }>
     description?: string | null
@@ -204,6 +248,33 @@ type SubtitleTrack = {
 type SubtitleResponse = {
   tracks: SubtitleTrack[]
   preferred_filename: string | null
+}
+
+type VideoCompatibility = {
+  download_id: string
+  file_name: string
+  container: string | null
+  video_codec: string | null
+  audio_codec: string | null
+  audio_track_count: number
+  subtitle_track_count: number
+  direct_play_likely: boolean
+  remux_available: boolean
+  reason: string
+  players: { system: boolean, iina: boolean, vlc: boolean }
+}
+
+type MediaDerivativeJob = {
+  id: string
+  download_id: string
+  kind: 'compatibility_remux'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted'
+  file_path: string | null
+  file_size: number | null
+  library_video_id: string | null
+  error: string | null
+  created_at: string
+  updated_at: string
 }
 
 type MetadataPlaylistOption = {
@@ -249,6 +320,17 @@ type LibraryResponse = {
   page: number
   page_size: number
   total_pages: number
+}
+
+type ContinueWatchingItem = {
+  reason: 'continue' | 'next'
+  playlist_title?: string | null
+  video: Download
+}
+
+type ContinueWatchingResponse = {
+  continuing: ContinueWatchingItem[]
+  next_up: ContinueWatchingItem[]
 }
 
 type TaskPageResponse = {
@@ -335,6 +417,8 @@ type DownloadSettings = {
   download_dir: string
   directory_pattern: string
   library_dirs: string[]
+  scan_library_on_startup: boolean
+  last_library_scan: (LibraryScanReport & { status: string, started_at: string, finished_at: string | null }) | null
   write_thumbnail: boolean
   write_info_json: boolean
   max_concurrent_downloads: number
@@ -459,7 +543,7 @@ type BackupPreview = {
   expires_in_seconds: number
   created_at: string | null
   application: { api_version?: string, yt_dlp_version?: string }
-  counts: Record<'playlists' | 'downloads' | 'download_logs' | 'video_denoise_jobs' | 'app_settings', number>
+  counts: Record<'playlists' | 'downloads' | 'download_logs' | 'video_denoise_jobs' | 'media_derivative_jobs' | 'source_follows' | 'app_settings', number>
   missing_media_files: number
   includes_media_files: false
 }
@@ -480,6 +564,11 @@ type YtDlpUpdateCheck = {
 
 type Page = 'tasks' | 'videos' | 'audio' | 'settings'
 type TaskFilter = 'all' | 'active' | 'attention'
+type CompletedDownloadNotice = {
+  downloadId: string
+  title: string
+  mediaType: 'video' | 'audio'
+}
 type TaskActionTarget =
   | { task: Download, action: 'cancel' | 'delete' }
   | { taskIds: string[], action: 'deleteMany' }
@@ -586,6 +675,15 @@ function downloadInputLines(value: string): string[] {
       .map((line) => line.trim())
       .filter((line) => /^(https?|ftp|magnet|thunder):/i.test(line)),
   )).slice(0, 50)
+}
+
+function isCompleteHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value.trim())
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && Boolean(parsed.hostname)
+  } catch {
+    return false
+  }
 }
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
@@ -1015,62 +1113,73 @@ function AudioWavePlayer({ src, title, thumbnail, initialTime = 0, autoPlay = fa
   useEffect(() => { hasNextRef.current = Boolean(onNext) }, [onNext])
 
   useEffect(() => {
-    if (!waveformRef.current) return
-    const wave = WaveSurfer.create({
-      container: waveformRef.current,
-      url: src,
-      backend: 'MediaElement',
-      autoplay: autoPlay,
-      height: 96,
-      waveColor: '#526046',
-      progressColor: '#d4f65b',
-      cursorColor: '#efffae',
-      cursorWidth: 2,
-      barWidth: 3,
-      barGap: 2,
-      barRadius: 2,
-      barMinHeight: 2,
-      dragToSeek: true,
-      hideScrollbar: true,
-      autoScroll: false,
-      autoCenter: false,
-      normalize: true,
-    })
-    waveSurferRef.current = wave
+    const container = waveformRef.current
+    if (!container) return
+    let cancelled = false
+    let wave: WaveSurfer | null = null
 
-    wave.on('loading', (percent) => setLoadingPercent(percent))
-    wave.on('ready', (loadedDuration) => {
-      setDuration(loadedDuration)
-      setIsReady(true)
-      if (initialTime > 0 && initialTime < loadedDuration - 5) {
-        wave.setTime(initialTime)
-      }
+    void import('wavesurfer.js').then(({ default: WaveSurfer }) => {
+      if (cancelled) return
+      const player = WaveSurfer.create({
+        container,
+        url: src,
+        backend: 'MediaElement',
+        autoplay: autoPlay,
+        height: 96,
+        waveColor: '#526046',
+        progressColor: '#d4f65b',
+        cursorColor: '#efffae',
+        cursorWidth: 2,
+        barWidth: 3,
+        barGap: 2,
+        barRadius: 2,
+        barMinHeight: 2,
+        dragToSeek: true,
+        hideScrollbar: true,
+        autoScroll: false,
+        autoCenter: false,
+        normalize: true,
+      })
+      wave = player
+      waveSurferRef.current = player
+
+      player.on('loading', (percent) => setLoadingPercent(percent))
+      player.on('ready', (loadedDuration) => {
+        setDuration(loadedDuration)
+        setIsReady(true)
+        if (initialTime > 0 && initialTime < loadedDuration - 5) {
+          player.setTime(initialTime)
+        }
+      })
+      player.on('play', () => setIsPlaying(true))
+      player.on('pause', () => {
+        setIsPlaying(false)
+        onProgressRef.current?.(player.getCurrentTime(), player.getDuration(), true)
+      })
+      player.on('timeupdate', (time) => {
+        setCurrentTime(time)
+        onProgressRef.current?.(time, player.getDuration(), false)
+      })
+      player.on('finish', () => {
+        setIsPlaying(false)
+        onProgressRef.current?.(player.getDuration(), player.getDuration(), true)
+        onEndedRef.current?.()
+        if (repeatModeRef.current === 'one' || (repeatModeRef.current === 'all' && !hasNextRef.current)) {
+          player.setTime(0)
+          void player.play()
+        }
+      })
+      player.on('error', () => onErrorRef.current())
+    }).catch(() => {
+      if (!cancelled) onErrorRef.current()
     })
-    wave.on('play', () => setIsPlaying(true))
-    wave.on('pause', () => {
-      setIsPlaying(false)
-      onProgressRef.current?.(wave.getCurrentTime(), wave.getDuration(), true)
-    })
-    wave.on('timeupdate', (time) => {
-      setCurrentTime(time)
-      onProgressRef.current?.(time, wave.getDuration(), false)
-    })
-    wave.on('finish', () => {
-      setIsPlaying(false)
-      onProgressRef.current?.(wave.getDuration(), wave.getDuration(), true)
-      onEndedRef.current?.()
-      if (repeatModeRef.current === 'one' || (repeatModeRef.current === 'all' && !hasNextRef.current)) {
-        wave.setTime(0)
-        void wave.play()
-        return
-      }
-    })
-    wave.on('error', () => onErrorRef.current())
 
     return () => {
+      cancelled = true
+      if (!wave) return
       onProgressRef.current?.(wave.getCurrentTime(), wave.getDuration(), true)
       wave.destroy()
-      waveSurferRef.current = null
+      if (waveSurferRef.current === wave) waveSurferRef.current = null
     }
   }, [autoPlay, src])
 
@@ -1127,13 +1236,24 @@ function AudioWavePlayer({ src, title, thumbnail, initialTime = 0, autoPlay = fa
 export default function App() {
   const [health, setHealth] = useState<Health | null>(null)
   const [page, setPage] = useState<Page>('videos')
+  const [legalModal, setLegalModal] = useState<'open-source' | 'disclaimer' | null>(null)
   const [taskFilter, setTaskFilter] = useState<TaskFilter>('all')
   const [tasks, setTasks] = useState<Download[]>([])
   const [taskPage, setTaskPage] = useState(1)
   const [taskTotal, setTaskTotal] = useState(0)
   const [taskTotalPages, setTaskTotalPages] = useState(0)
   const [taskCounts, setTaskCounts] = useState({ all: 0, active: 0, attention: 0 })
+  const [completedDownloadNotice, setCompletedDownloadNotice] = useState<CompletedDownloadNotice | null>(null)
   const [libraryItems, setLibraryItems] = useState<LibraryItem[]>([])
+  const [continueWatching, setContinueWatching] = useState<ContinueWatchingResponse>({ continuing: [], next_up: [] })
+  const [sourceFollows, setSourceFollows] = useState<SourceFollow[]>([])
+  const [sourceFollowOpen, setSourceFollowOpen] = useState(false)
+  const [sourceFollowUrl, setSourceFollowUrl] = useState('')
+  const [activeSourceFollowId, setActiveSourceFollowId] = useState<string | null>(null)
+  const [selectedFollowEntryUrls, setSelectedFollowEntryUrls] = useState<string[]>([])
+  const [sourceFollowWorking, setSourceFollowWorking] = useState<string | null>(null)
+  const [sourceFollowNotice, setSourceFollowNotice] = useState<string | null>(null)
+  const sourceFollowsStartupCheckedRef = useRef(false)
   const [libraryFilterItems, setLibraryFilterItems] = useState<LibraryItem[]>([])
   const [libraryTotal, setLibraryTotal] = useState(0)
   const [videoLibraryTotal, setVideoLibraryTotal] = useState(0)
@@ -1188,6 +1308,7 @@ export default function App() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general')
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [taskDetailDismissed, setTaskDetailDismissed] = useState(false)
+  const [mobileTopActionsOpen, setMobileTopActionsOpen] = useState(false)
   const [selectedTask, setSelectedTask] = useState<Download | null>(null)
   const [logs, setLogs] = useState<TaskLog[]>([])
   const [taskOutputs, setTaskOutputs] = useState<DownloadOutput[]>([])
@@ -1201,6 +1322,7 @@ export default function App() {
   const selectedTaskIdRef = useRef<string | null>(null)
   const selectedVideoIdRef = useRef<string | null>(null)
   const taskDetailCloseRef = useRef<HTMLButtonElement | null>(null)
+  const mobileTopActionsRef = useRef<HTMLDivElement | null>(null)
   const videoDetailCloseRef = useRef<HTMLButtonElement | null>(null)
   const videoDetailMenuRootRef = useRef<HTMLDivElement | null>(null)
   const videoDetailMenuButtonRef = useRef<HTMLButtonElement | null>(null)
@@ -1209,6 +1331,9 @@ export default function App() {
   const [playerVideo, setPlayerVideo] = useState<Download | null>(null)
   const [playlistVideos, setPlaylistVideos] = useState<Download[]>([])
   const [playerNotice, setPlayerNotice] = useState<string | null>(null)
+  const [videoCompatibility, setVideoCompatibility] = useState<VideoCompatibility | null>(null)
+  const [compatibilityJob, setCompatibilityJob] = useState<MediaDerivativeJob | null>(null)
+  const [compatibilityWorking, setCompatibilityWorking] = useState<string | null>(null)
   const [videoSubtitles, setVideoSubtitles] = useState<SubtitleTrack[]>([])
   const [selectedSubtitleFilename, setSelectedSubtitleFilename] = useState('')
   const [audioRepeatMode, setAudioRepeatMode] = useState<AudioRepeatMode>('off')
@@ -1235,6 +1360,11 @@ export default function App() {
   const [metadataEditLoading, setMetadataEditLoading] = useState(false)
   const [metadataEditWorking, setMetadataEditWorking] = useState(false)
   const [metadataEditNotice, setMetadataEditNotice] = useState<string | null>(null)
+  const [upgradeTarget, setUpgradeTarget] = useState<Download | null>(null)
+  const [upgradeOptions, setUpgradeOptions] = useState<VideoUpgradeOptions | null>(null)
+  const [upgradeFormat, setUpgradeFormat] = useState('')
+  const [upgradeWorking, setUpgradeWorking] = useState(false)
+  const [upgradeNotice, setUpgradeNotice] = useState<string | null>(null)
   const [localVideoOpen, setLocalVideoOpen] = useState(false)
   const [localDirectoryPath, setLocalDirectoryPath] = useState('')
   const [localMediaFiles, setLocalMediaFiles] = useState<LocalMediaFile[]>([])
@@ -1271,6 +1401,8 @@ export default function App() {
   const [selectedPlaylistUrls, setSelectedPlaylistUrls] = useState<string[]>([])
   const [selectedPlaylistFormat, setSelectedPlaylistFormat] = useState('')
   const [selectedTorrentFileIndexes, setSelectedTorrentFileIndexes] = useState<number[]>([])
+  const [torrentFileQuery, setTorrentFileQuery] = useState('')
+  const [torrentVisibleFileCount, setTorrentVisibleFileCount] = useState(torrentVisibleFileStep)
   const [selectedFormat, setSelectedFormat] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [working, setWorking] = useState(false)
@@ -1392,22 +1524,60 @@ export default function App() {
     }
   }, [videoFileStatus])
 
+  const refreshContinueWatching = useCallback(async () => {
+    try {
+      setContinueWatching(await api<ContinueWatchingResponse>('/api/v1/library/continue-watching?limit=8'))
+    } catch {
+      setContinueWatching({ continuing: [], next_up: [] })
+    }
+  }, [])
+
+  const refreshSourceFollows = useCallback(async (checkStartup = false) => {
+    try {
+      let follows = await api<SourceFollow[]>('/api/v1/follows')
+      setSourceFollows(follows)
+      setActiveSourceFollowId((current) => current && follows.some((follow) => follow.id === current)
+        ? current
+        : follows[0]?.id || null)
+      if (checkStartup && !sourceFollowsStartupCheckedRef.current) {
+        sourceFollowsStartupCheckedRef.current = true
+        await Promise.allSettled(follows
+          .filter((follow) => follow.check_on_startup)
+          .map((follow) => api<SourceFollow>(`/api/v1/follows/${follow.id}/check`, { method: 'POST' })))
+        follows = await api<SourceFollow[]>('/api/v1/follows')
+        setSourceFollows(follows)
+      }
+    } catch {
+      setSourceFollows([])
+    }
+  }, [])
+
+  const refreshLibraryTotals = useCallback(async () => {
+    try {
+      const [videoLibrary, audioLibrary] = await Promise.all([
+        api<LibraryResponse>('/api/v1/library/items?page_size=1&media_type=video&include_playlists=true'),
+        api<LibraryResponse>('/api/v1/library/items?page_size=1&media_type=audio'),
+      ])
+      setVideoLibraryTotal(videoLibrary.total)
+      setAudioLibraryTotal(audioLibrary.total)
+    } catch {
+      // Keep the previous totals until the next successful refresh.
+    }
+  }, [])
+
   const refreshVideoFilterItems = useCallback(async () => {
     try {
       const mediaType = page === 'audio' ? 'audio' : 'video'
       const includePlaylists = mediaType === 'video' ? '&include_playlists=true' : ''
-      const [library, videoLibrary, audioLibrary] = await Promise.all([
+      const [library] = await Promise.all([
         api<LibraryResponse>(`/api/v1/library/items?page_size=200&media_type=${mediaType}${includePlaylists}`),
-        api<LibraryResponse>('/api/v1/library/items?page_size=1&media_type=video&include_playlists=true'),
-        api<LibraryResponse>('/api/v1/library/items?page_size=1&media_type=audio'),
+        refreshLibraryTotals(),
       ])
       setLibraryFilterItems(library.items)
-      setVideoLibraryTotal(videoLibrary.total)
-      setAudioLibraryTotal(audioLibrary.total)
     } catch {
       // Keep the previous filter options if the refresh temporarily fails.
     }
-  }, [page])
+  }, [page, refreshLibraryTotals])
 
   const refreshCollectionVideos = useCallback(async (playlistId: string) => {
     try {
@@ -1424,6 +1594,7 @@ export default function App() {
         ...savedSettings,
         directory_pattern: savedSettings.directory_pattern ?? '{platform}/{year}-{month}/{title}',
         library_dirs: savedSettings.library_dirs || [],
+        scan_library_on_startup: savedSettings.scan_library_on_startup ?? true,
         yt_dlp_config: savedSettings.yt_dlp_config || '',
         yt_dlp_simple: savedSettings.yt_dlp_simple || defaultYtDlpSimpleSettings,
         ffmpeg_config: savedSettings.ffmpeg_config || '',
@@ -1478,6 +1649,10 @@ export default function App() {
     [libraryItems, selectedLibraryKey],
   )
   const selectedPlaylist = selectedLibraryItem?.kind === 'playlist' ? selectedLibraryItem : null
+  const activeSourceFollow = useMemo(
+    () => sourceFollows.find((follow) => follow.id === activeSourceFollowId) || null,
+    [activeSourceFollowId, sourceFollows],
+  )
 
   useEffect(() => {
     tasksRef.current = tasks
@@ -1495,11 +1670,12 @@ export default function App() {
     void refreshHealth()
     void refreshTasks()
     void refreshSettings()
+    void refreshSourceFollows(true)
     const timer = window.setInterval(() => {
       void refreshHealth()
     }, 10000)
     return () => window.clearInterval(timer)
-  }, [refreshHealth, refreshSettings, refreshTasks])
+  }, [refreshHealth, refreshSettings, refreshSourceFollows, refreshTasks])
 
   useEffect(() => {
     if (page !== 'tasks') return
@@ -1509,6 +1685,7 @@ export default function App() {
     }, 2000)
     return () => window.clearInterval(timer)
   }, [page, refreshTaskProgress])
+
 
   useEffect(() => {
     if (page === 'videos' || page === 'audio') void refreshVideos({
@@ -1525,6 +1702,10 @@ export default function App() {
       sortOrder: videoSortOrder,
     })
   }, [page, refreshVideos, search, videoFavoritesOnly, videoFileFormats, videoFileStatus, videoPage, videoPageSize, videoPlatforms, videoResolution, videoSortBy, videoSortOrder])
+
+  useEffect(() => {
+    if (page === 'videos') void refreshContinueWatching()
+  }, [page, refreshContinueWatching])
 
   useEffect(() => {
     if (page === 'videos' || page === 'audio') void refreshVideoFilterItems()
@@ -1547,6 +1728,29 @@ export default function App() {
     if (!selectedTaskId || !window.matchMedia('(max-width: 1080px)').matches) return
     window.requestAnimationFrame(() => taskDetailCloseRef.current?.focus())
   }, [selectedTaskId])
+
+  useEffect(() => {
+    setMobileTopActionsOpen(false)
+  }, [page])
+
+  useEffect(() => {
+    if (!mobileTopActionsOpen) return
+
+    function closeMobileActions(event: PointerEvent) {
+      if (!mobileTopActionsRef.current?.contains(event.target as Node)) setMobileTopActionsOpen(false)
+    }
+
+    function closeMobileActionsWithKeyboard(event: KeyboardEvent) {
+      if (event.key === 'Escape') setMobileTopActionsOpen(false)
+    }
+
+    document.addEventListener('pointerdown', closeMobileActions)
+    document.addEventListener('keydown', closeMobileActionsWithKeyboard)
+    return () => {
+      document.removeEventListener('pointerdown', closeMobileActions)
+      document.removeEventListener('keydown', closeMobileActionsWithKeyboard)
+    }
+  }, [mobileTopActionsOpen])
 
   useEffect(() => {
     setSelectedTaskIds((current) => current.filter((id) => tasks.some((task) => task.id === id && !['queued', 'running', 'processing'].includes(task.status))))
@@ -1614,6 +1818,15 @@ export default function App() {
         void refreshTasks()
         if (selectedTaskIdRef.current === download.id) void refreshDetail(download.id)
       }
+      if (download.status === 'completed') {
+        const mediaType = libraryItemMediaType({ kind: 'video', ...download }) === 'audio' ? 'audio' : 'video'
+        setCompletedDownloadNotice((current) => current?.downloadId === download.id ? current : {
+          downloadId: download.id,
+          title: download.title || (mediaType === 'audio' ? '音频' : '视频'),
+          mediaType,
+        })
+        void refreshLibraryTotals()
+      }
       if (download.status === 'completed' && (page === 'videos' || page === 'audio')) {
         void refreshVideos({
           title: search,
@@ -1645,7 +1858,7 @@ export default function App() {
       })
     })
     return () => stream.close()
-  }, [page, refreshCollectionVideos, refreshDetail, refreshTasks, refreshVideoFilterItems, refreshVideos, search, selectedPlaylist?.id, videoFavoritesOnly, videoFileFormats, videoPage, videoPageSize, videoPlatforms, videoResolution, videoSortBy, videoSortOrder])
+  }, [page, refreshCollectionVideos, refreshDetail, refreshLibraryTotals, refreshTasks, refreshVideoFilterItems, refreshVideos, search, selectedPlaylist?.id, videoFavoritesOnly, videoFileFormats, videoPage, videoPageSize, videoPlatforms, videoResolution, videoSortBy, videoSortOrder])
 
   useEffect(() => {
     if (!playerVideo || libraryItemMediaType({ kind: 'video', ...playerVideo }) !== 'video') {
@@ -1665,6 +1878,53 @@ export default function App() {
     })
     return () => { cancelled = true }
   }, [playerVideo?.id])
+
+  useEffect(() => {
+    if (!playerVideo || libraryItemMediaType({ kind: 'video', ...playerVideo }) !== 'video') {
+      setVideoCompatibility(null)
+      setCompatibilityJob(null)
+      return
+    }
+    let cancelled = false
+    setVideoCompatibility(null)
+    void Promise.all([
+      api<VideoCompatibility>(`/api/v1/videos/${playerVideo.id}/compatibility`),
+      api<MediaDerivativeJob[]>(`/api/v1/videos/${playerVideo.id}/compatibility/jobs`),
+    ]).then(([compatibility, jobs]) => {
+      if (cancelled) return
+      setVideoCompatibility(compatibility)
+      setCompatibilityJob(jobs[0] || null)
+    }).catch(() => {
+      if (!cancelled) setVideoCompatibility(null)
+    })
+    return () => { cancelled = true }
+  }, [playerVideo?.id])
+
+  useEffect(() => {
+    if (!compatibilityJob || !['queued', 'running'].includes(compatibilityJob.status)) return
+    const timer = window.setInterval(() => {
+      void api<MediaDerivativeJob>(`/api/v1/media-derivative-jobs/${compatibilityJob.id}`).then((job) => {
+        setCompatibilityJob(job)
+        if (job.status === 'completed') {
+          setPlayerNotice('兼容副本已生成并加入视频管理。')
+          void refreshVideos({
+            title: search,
+            platforms: videoPlatforms,
+            fileFormats: videoFileFormats,
+            resolution: videoResolution,
+            mediaType: 'video',
+            fileStatus: videoFileStatus,
+            favoriteOnly: videoFavoritesOnly,
+            page: videoPage,
+            pageSize: videoPageSize,
+            sortBy: videoSortBy,
+            sortOrder: videoSortOrder,
+          })
+        }
+      }).catch(() => undefined)
+    }, 1500)
+    return () => window.clearInterval(timer)
+  }, [compatibilityJob, refreshVideos, search, videoFavoritesOnly, videoFileFormats, videoFileStatus, videoPage, videoPageSize, videoPlatforms, videoResolution, videoSortBy, videoSortOrder])
 
   useEffect(() => {
     const videoElement = videoPlayerElementRef.current
@@ -1700,6 +1960,8 @@ export default function App() {
       void api<Download>(`/api/v1/videos/${playerVideo.id}/progress`, {
         method: 'PUT',
         body: JSON.stringify({ position, duration }),
+      }).then(() => {
+        if (force) void refreshContinueWatching()
       }).catch(() => undefined)
     }
     const handleTimeUpdate = () => saveProgress(false)
@@ -1724,7 +1986,7 @@ export default function App() {
       videoElement.removeEventListener('pause', handlePause)
       videoElement.removeEventListener('ended', handleEnded)
     }
-  }, [playerVideo?.id])
+  }, [playerVideo?.id, refreshContinueWatching])
 
   useEffect(() => {
     if (!playerVideo || libraryItemMediaType({ kind: 'video', ...playerVideo }) !== 'video' || !videoPlayerElementRef.current) return
@@ -1800,6 +2062,7 @@ export default function App() {
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') {
+        setLegalModal(null)
         setVideoDetailMenuOpen(false)
         setAdvancedSearchOpen(false)
         setVideoBatchAction(null)
@@ -1826,6 +2089,39 @@ export default function App() {
       : null,
     [torrentMediaFiles],
   )
+  const selectedTorrentMediaFiles = useMemo(
+    () => torrentMediaFiles.filter((file) => selectedTorrentFileIndexes.includes(file.index)),
+    [selectedTorrentFileIndexes, torrentMediaFiles],
+  )
+  const selectedTorrentMediaSize = useMemo(
+    () => selectedTorrentMediaFiles.length > 0 && selectedTorrentMediaFiles.every((file) => file.size !== null)
+      ? selectedTorrentMediaFiles.reduce((total, file) => total + (file.size || 0), 0)
+      : null,
+    [selectedTorrentMediaFiles],
+  )
+  const filteredTorrentMediaFiles = useMemo(() => {
+    const query = torrentFileQuery.trim().toLocaleLowerCase()
+    return query
+      ? torrentMediaFiles.filter((file) => file.path.toLocaleLowerCase().includes(query))
+      : torrentMediaFiles
+  }, [torrentFileQuery, torrentMediaFiles])
+  const torrentFileGroups = useMemo(() => {
+    const groups = new Map<string, typeof torrentMediaFiles>()
+    filteredTorrentMediaFiles.forEach((file) => {
+      const folder = torrentFolderLabel(file.path)
+      groups.set(folder, [...(groups.get(folder) || []), file])
+    })
+    return Array.from(groups, ([name, files]) => ({ name, files }))
+  }, [filteredTorrentMediaFiles, torrentMediaFiles])
+  const visibleTorrentFileGroups = useMemo(() => {
+    let remaining = torrentVisibleFileCount
+    return torrentFileGroups.flatMap((group) => {
+      if (remaining <= 0) return []
+      const visibleFiles = group.files.slice(0, remaining)
+      remaining -= visibleFiles.length
+      return visibleFiles.length > 0 ? [{ ...group, visibleFiles }] : []
+    })
+  }, [torrentFileGroups, torrentVisibleFileCount])
   const availableLocalMediaFiles = useMemo(
     () => Array.isArray(localMediaFiles)
       ? localMediaFiles.filter((file) => !file.already_added)
@@ -1919,6 +2215,8 @@ export default function App() {
     setSelectedPlaylistUrls([])
     setSelectedPlaylistFormat('')
     setSelectedTorrentFileIndexes([])
+    setTorrentFileQuery('')
+    setTorrentVisibleFileCount(torrentVisibleFileStep)
     setUrl('')
     setEngineHint('auto')
     setDownloadPriority(0)
@@ -1941,6 +2239,105 @@ export default function App() {
       setEngineHint('auto')
       setNotice(clipboardUrls.length > 1 ? `已从剪贴板识别 ${clipboardUrls.length} 个链接。` : '已从剪贴板识别下载链接。')
     }).catch(() => undefined)
+  }
+
+  function openSourceFollows(prefillUrl = '') {
+    setSourceFollowUrl(prefillUrl)
+    setSourceFollowNotice(null)
+    setSelectedFollowEntryUrls([])
+    setSourceFollowOpen(true)
+    void refreshSourceFollows(false)
+  }
+
+  async function addSourceFollow(event: FormEvent) {
+    event.preventDefault()
+    const followUrl = sourceFollowUrl.trim()
+    if (!followUrl) return
+    setSourceFollowWorking('add')
+    setSourceFollowNotice('正在读取频道或合集，请稍候…')
+    try {
+      const created = await api<SourceFollow>('/api/v1/follows', {
+        method: 'POST',
+        body: JSON.stringify({ url: followUrl, check_on_startup: true }),
+      })
+      await refreshSourceFollows(false)
+      setActiveSourceFollowId(created.id)
+      setSelectedFollowEntryUrls(created.entries.map((entry) => entry.webpage_url))
+      setSourceFollowUrl('')
+      setSourceFollowNotice(created.new_count ? `已关注，发现 ${created.new_count} 个尚未下载的视频。` : '已关注，目前没有新增视频。')
+    } catch (error) {
+      setSourceFollowNotice(error instanceof Error ? error.message : '关注源未添加。')
+    } finally {
+      setSourceFollowWorking(null)
+    }
+  }
+
+  async function checkSourceFollow(follow: SourceFollow) {
+    setSourceFollowWorking(`check:${follow.id}`)
+    setSourceFollowNotice(`正在检查“${follow.title}”…`)
+    try {
+      const updated = await api<SourceFollow>(`/api/v1/follows/${follow.id}/check`, { method: 'POST' })
+      setSourceFollows((current) => current.map((item) => item.id === updated.id ? updated : item))
+      setSelectedFollowEntryUrls(updated.entries.map((entry) => entry.webpage_url))
+      setSourceFollowNotice(updated.new_count ? `发现 ${updated.new_count} 个尚未下载的视频。` : '检查完成，没有新增视频。')
+    } catch (error) {
+      await refreshSourceFollows(false)
+      setSourceFollowNotice(error instanceof Error ? error.message : '更新检查失败。')
+    } finally {
+      setSourceFollowWorking(null)
+    }
+  }
+
+  async function toggleSourceFollowStartup(follow: SourceFollow) {
+    setSourceFollowWorking(`setting:${follow.id}`)
+    try {
+      const updated = await api<SourceFollow>(`/api/v1/follows/${follow.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ check_on_startup: !follow.check_on_startup }),
+      })
+      setSourceFollows((current) => current.map((item) => item.id === updated.id ? updated : item))
+    } catch (error) {
+      setSourceFollowNotice(error instanceof Error ? error.message : '启动检查设置未保存。')
+    } finally {
+      setSourceFollowWorking(null)
+    }
+  }
+
+  async function deleteSourceFollow(follow: SourceFollow) {
+    setSourceFollowWorking(`delete:${follow.id}`)
+    try {
+      await api<{ id: string }>(`/api/v1/follows/${follow.id}`, { method: 'DELETE' })
+      setSourceFollows((current) => current.filter((item) => item.id !== follow.id))
+      setActiveSourceFollowId((current) => current === follow.id ? null : current)
+      setSelectedFollowEntryUrls([])
+      setSourceFollowNotice('已取消关注；本地媒体和下载任务没有变化。')
+    } catch (error) {
+      setSourceFollowNotice(error instanceof Error ? error.message : '无法取消关注。')
+    } finally {
+      setSourceFollowWorking(null)
+    }
+  }
+
+  async function downloadFollowEntries(follow: SourceFollow) {
+    if (selectedFollowEntryUrls.length === 0) return
+    setSourceFollowWorking(`download:${follow.id}`)
+    setSourceFollowNotice(`正在创建 ${selectedFollowEntryUrls.length} 个下载任务…`)
+    try {
+      const response = await api<BatchDownloadResponse & { follow: SourceFollow }>(`/api/v1/follows/${follow.id}/downloads`, {
+        method: 'POST',
+        body: JSON.stringify({ entry_urls: selectedFollowEntryUrls, priority: downloadPriority }),
+      })
+      setSourceFollows((current) => current.map((item) => item.id === response.follow.id ? response.follow : item))
+      setSelectedFollowEntryUrls([])
+      void refreshTasks()
+      setSourceFollowNotice(response.failed
+        ? `已创建 ${response.created} 个任务，${response.failed} 个未创建；失败项目仍保留在新增列表。`
+        : `已创建 ${response.created} 个下载任务。`)
+    } catch (error) {
+      setSourceFollowNotice(error instanceof Error ? error.message : '下载任务未创建。')
+    } finally {
+      setSourceFollowWorking(null)
+    }
   }
 
   function closeResourceSearch() {
@@ -2101,6 +2498,8 @@ export default function App() {
 
   function openLibraryPage(nextPage: 'videos' | 'audio') {
     closeLibraryDetail()
+    setCompletedDownloadNotice(null)
+    setMobileTopActionsOpen(false)
     setSelectedVideoIds([])
     setVideoResolution('')
     setVideoPage(1)
@@ -2138,6 +2537,41 @@ export default function App() {
       const direction = event.key === 'ArrowDown' ? 1 : -1
       const nextIndex = (currentIndex + direction + menuItems.length) % menuItems.length
       menuItems[nextIndex]?.focus()
+    }
+  }
+
+  async function openExternalPlayer(video: Download, player: 'system' | 'iina' | 'vlc') {
+    setCompatibilityWorking(`open:${player}`)
+    setPlayerNotice(null)
+    setVideoActionNotice(null)
+    try {
+      await api<{ download_id: string, player: string }>(`/api/v1/videos/${video.id}/open`, {
+        method: 'POST',
+        body: JSON.stringify({ player }),
+      })
+      const label = player === 'system' ? '系统默认播放器' : player === 'iina' ? 'IINA' : 'VLC'
+      const message = `已使用${label}打开。外部播放器中的进度不会自动同步回来。`
+      setPlayerNotice(message)
+      setVideoActionNotice(message)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '无法打开外部播放器。'
+      setPlayerNotice(message)
+      setVideoActionNotice(message)
+    } finally {
+      setCompatibilityWorking(null)
+    }
+  }
+
+  async function startCompatibilityRemux(video: Download) {
+    setCompatibilityWorking('remux')
+    setPlayerNotice('正在创建兼容封装任务；原始文件保持不变。')
+    try {
+      const job = await api<MediaDerivativeJob>(`/api/v1/videos/${video.id}/compatibility/remux`, { method: 'POST' })
+      setCompatibilityJob(job)
+    } catch (error) {
+      setPlayerNotice(error instanceof Error ? error.message : '兼容副本任务未创建。')
+    } finally {
+      setCompatibilityWorking(null)
     }
   }
 
@@ -2514,6 +2948,73 @@ export default function App() {
     }).finally(() => setMetadataEditLoading(false))
   }
 
+  function prepareVideoUpgrade(video: Download) {
+    setUpgradeTarget(video)
+    setUpgradeOptions(null)
+    setUpgradeFormat('')
+    setUpgradeNotice(null)
+    setUpgradeWorking(true)
+    setVideoDetailMenuOpen(false)
+    void api<VideoUpgradeOptions>(`/api/v1/videos/${video.id}/upgrade-options`).then((options) => {
+      setUpgradeOptions(options)
+      setUpgradeFormat(options.candidates.at(-1)?.format_id || '')
+      if (options.candidates.length === 0) setUpgradeNotice('当前文件已经没有可用的更高画质。')
+    }).catch((error) => {
+      setUpgradeNotice(error instanceof Error ? error.message : '无法检查更高画质。')
+    }).finally(() => setUpgradeWorking(false))
+  }
+
+  async function startVideoUpgrade() {
+    if (!upgradeTarget || !upgradeFormat) return
+    setUpgradeWorking(true)
+    setUpgradeNotice(null)
+    try {
+      const task = await api<Download>(`/api/v1/videos/${upgradeTarget.id}/upgrade`, {
+        method: 'POST',
+        body: JSON.stringify({ format_id: upgradeFormat, priority: 0 }),
+      })
+      setUpgradeTarget(null)
+      await refreshTasks()
+      setSelectedTaskId(task.id)
+      setTaskDetailDismissed(false)
+      setPage('tasks')
+    } catch (error) {
+      setUpgradeNotice(error instanceof Error ? error.message : '画质升级任务未创建。')
+    } finally {
+      setUpgradeWorking(false)
+    }
+  }
+
+  async function finalizeVideoUpgrade(removeOriginalFile: boolean) {
+    if (!selectedVideo?.upgrade_from_id) return
+    setUpgradeWorking(true)
+    setVideoActionNotice(null)
+    try {
+      const result = await api<{ video: Download }>(`/api/v1/videos/${selectedVideo.id}/upgrade-finalize`, {
+        method: 'POST',
+        body: JSON.stringify({ confirm: true, remove_original_file: removeOriginalFile }),
+      })
+      setSelectedVideo(result.video)
+      await Promise.all([refreshTasks(), refreshVideos({
+        title: search,
+        platforms: videoPlatforms,
+        fileFormats: videoFileFormats,
+        resolution: videoResolution,
+        mediaType: 'video',
+        favoriteOnly: videoFavoritesOnly,
+        page: videoPage,
+        pageSize: videoPageSize,
+        sortBy: videoSortBy,
+        sortOrder: videoSortOrder,
+      })])
+      setVideoActionNotice(removeOriginalFile ? '新版本已保留，旧版本已移入废纸篓。' : '已保留新旧两个版本。')
+    } catch (error) {
+      setVideoActionNotice(error instanceof Error ? error.message : '旧版本未处理，两个文件均已保留。')
+    } finally {
+      setUpgradeWorking(false)
+    }
+  }
+
   async function confirmMetadataEdit() {
     if (!metadataEditTarget) return
     setMetadataEditWorking(true)
@@ -2643,6 +3144,15 @@ export default function App() {
     setSelectedTorrentFileIndexes((current) => current.includes(index) ? current.filter((value) => value !== index) : [...current, index])
   }
 
+  function toggleTorrentGroup(indexes: number[]) {
+    setSelectedTorrentFileIndexes((current) => {
+      const allSelected = indexes.every((index) => current.includes(index))
+      return allSelected
+        ? current.filter((index) => !indexes.includes(index))
+        : Array.from(new Set([...current, ...indexes]))
+    })
+  }
+
   async function inspect(event: FormEvent) {
     event.preventDefault()
     if (!url.trim() && !torrentFile) return
@@ -2665,6 +3175,8 @@ export default function App() {
     setSelectedPlaylistUrls([])
     setSelectedPlaylistFormat('')
     setSelectedTorrentFileIndexes([])
+    setTorrentFileQuery('')
+    setTorrentVisibleFileCount(torrentVisibleFileStep)
     try {
       const job = await api<InspectJob>('/api/v1/downloads/inspect/start', {
         method: 'POST',
@@ -2701,6 +3213,7 @@ export default function App() {
       })
       await refreshTasks()
       if (response.failed === 0) {
+        setCompletedDownloadNotice(null)
         setPage('tasks')
         setSelectedTaskId(response.successes[0]?.download.id ?? null)
         closeModal()
@@ -2737,6 +3250,7 @@ export default function App() {
         }),
       })
       await refreshTasks()
+      setCompletedDownloadNotice(null)
       setPage('tasks')
       setSelectedTaskId(created.id)
       closeModal()
@@ -2761,6 +3275,7 @@ export default function App() {
         body: JSON.stringify({ inspect_id: inspectJob.id, entry_urls: selectedPlaylistUrls, format_id: selectedPlaylistFormat || null, replace_existing: replaceExisting, priority: downloadPriority }),
       })
       await refreshTasks()
+      setCompletedDownloadNotice(null)
       setPage('tasks')
       closeModal()
     } catch (error) {
@@ -2850,13 +3365,14 @@ export default function App() {
     }
   }
 
+
   async function saveSettings(tab: SettingsTab) {
     if (!settingsDraft) return
     setSavingSettings(tab)
     setSettingsNotice(null)
     try {
       const request = tab === 'general'
-        ? { path: '/api/v1/settings/general', body: { download_dir: settingsDraft.download_dir, directory_pattern: settingsDraft.directory_pattern, library_dirs: settingsDraft.library_dirs, write_thumbnail: settingsDraft.write_thumbnail, write_info_json: settingsDraft.write_info_json, max_concurrent_downloads: settingsDraft.max_concurrent_downloads, download_rate_limit_kbps: settingsDraft.download_rate_limit_kbps, minimum_free_space_mb: settingsDraft.minimum_free_space_mb, system_notifications: settingsDraft.system_notifications } }
+        ? { path: '/api/v1/settings/general', body: { download_dir: settingsDraft.download_dir, directory_pattern: settingsDraft.directory_pattern, library_dirs: settingsDraft.library_dirs, scan_library_on_startup: settingsDraft.scan_library_on_startup, write_thumbnail: settingsDraft.write_thumbnail, write_info_json: settingsDraft.write_info_json, max_concurrent_downloads: settingsDraft.max_concurrent_downloads, download_rate_limit_kbps: settingsDraft.download_rate_limit_kbps, minimum_free_space_mb: settingsDraft.minimum_free_space_mb, system_notifications: settingsDraft.system_notifications } }
         : tab === 'yt-dlp'
           ? { path: '/api/v1/settings/yt-dlp', body: { config: settingsDraft.yt_dlp_config, simple: settingsDraft.yt_dlp_simple } }
           : tab === 'ffmpeg'
@@ -2877,6 +3393,7 @@ export default function App() {
           download_dir: savedSettings.download_dir,
           directory_pattern: savedSettings.directory_pattern,
           library_dirs: savedSettings.library_dirs,
+          scan_library_on_startup: savedSettings.scan_library_on_startup,
           write_thumbnail: savedSettings.write_thumbnail,
           write_info_json: savedSettings.write_info_json,
           max_concurrent_downloads: savedSettings.max_concurrent_downloads,
@@ -3073,6 +3590,7 @@ export default function App() {
           download_dir: settingsDraft.download_dir,
           directory_pattern: settingsDraft.directory_pattern,
           library_dirs: settingsDraft.library_dirs,
+          scan_library_on_startup: settingsDraft.scan_library_on_startup,
           write_thumbnail: settingsDraft.write_thumbnail,
           write_info_json: settingsDraft.write_info_json,
           max_concurrent_downloads: settingsDraft.max_concurrent_downloads,
@@ -3286,9 +3804,15 @@ export default function App() {
           </button>
         </nav>
 
-        <div className="engine-status" aria-live="polite">
-          <span className={health ? 'dot is-online' : 'dot'} />
-          <div><b>{health ? '下载服务已就绪' : '正在连接本地服务'}</b><small>{health ? `${health.engine} · ${health.engines?.qbittorrent?.available ? `qBittorrent ${health.engines.qbittorrent.version}` : health.engines?.aria2.version || 'aria2'}` : '请确认本地服务已启动'}</small></div>
+        <div className="sidebar-footer">
+          <div className="sidebar-legal">
+            <small>本地工具 · 不内置媒体链接</small>
+            <div><button type="button" onClick={() => setLegalModal('open-source')}>开源与致谢</button><span>·</span><button type="button" onClick={() => setLegalModal('disclaimer')}>使用与免责</button></div>
+          </div>
+          <div className="engine-status" aria-live="polite">
+            <span className={health ? 'dot is-online' : 'dot'} />
+            <div><b>{health ? '下载服务已就绪' : '正在连接本地服务'}</b><small>{health ? `${health.engine} · ${health.engines?.qbittorrent?.available ? `qBittorrent ${health.engines.qbittorrent.version}` : health.engines?.aria2.version || 'aria2'}` : '请确认本地服务已启动'}</small></div>
+          </div>
         </div>
       </aside>
 
@@ -3298,7 +3822,16 @@ export default function App() {
             <h1>{page === 'tasks' ? '下载任务' : page === 'videos' ? '视频管理' : page === 'audio' ? '音频管理' : '设置'}</h1>
           </div>
           {page !== 'settings' && <div className="top-actions">
+            <div className="mobile-top-actions" ref={mobileTopActionsRef}>
+              <button className="mobile-top-actions-trigger" type="button" aria-label="更多页面操作" aria-haspopup="menu" aria-expanded={mobileTopActionsOpen} onClick={() => setMobileTopActionsOpen((current) => !current)}><Icon name="more" size={18} /></button>
+              {mobileTopActionsOpen && <div className="mobile-top-actions-menu" role="menu">
+                {(page === 'videos' || page === 'audio') && <button type="button" role="menuitem" onClick={() => { setMobileTopActionsOpen(false); openLocalVideo() }}><Icon name="library" size={16} />添加本地媒体</button>}
+                {page === 'videos' && <button type="button" role="menuitem" onClick={() => { setMobileTopActionsOpen(false); openSourceFollows() }}><Icon name="repeat" size={16} />关注更新</button>}
+                <button type="button" role="menuitem" onClick={() => { setMobileTopActionsOpen(false); void openResourceSearch() }}><Icon name="search" size={16} />搜索资源</button>
+              </div>}
+            </div>
             {(page === 'videos' || page === 'audio') && <button className="resource-search-button" onClick={openLocalVideo} aria-label="添加本地媒体"><Icon name="library" size={17} /><span>添加本地媒体</span></button>}
+            {page === 'videos' && <button className="resource-search-button" onClick={() => openSourceFollows()} aria-label="关注更新"><Icon name="repeat" size={17} /><span>关注更新{sourceFollows.some((follow) => follow.new_count > 0) ? ` · ${sourceFollows.reduce((total, follow) => total + follow.new_count, 0)}` : ''}</span></button>}
             <button className="resource-search-button" onClick={() => void openResourceSearch()} aria-label="搜索资源"><Icon name="search" size={17} /><span>搜索资源</span></button>
             <button className="new-task-button compact-new-task" onClick={openNewDownload} aria-label="新建下载"><Icon name="add" size={17} /><span>新建下载</span></button>
           </div>}
@@ -3307,6 +3840,12 @@ export default function App() {
         {page === 'tasks' ? (
           <section className={selectedTaskId ? 'task-workspace has-detail' : 'task-workspace'}>
             <div className="table-area">
+              {completedDownloadNotice && <div className="download-completion" role="status">
+                <span className="download-completion-icon"><Icon name="check" size={18} /></span>
+                <div><b>下载完成</b><span>{completedDownloadNotice.title} 已加入{completedDownloadNotice.mediaType === 'audio' ? '音频' : '视频'}管理。</span></div>
+                <button className="download-completion-action" type="button" onClick={() => openLibraryPage(completedDownloadNotice.mediaType === 'audio' ? 'audio' : 'videos')}>查看{completedDownloadNotice.mediaType === 'audio' ? '音频' : '视频'}</button>
+                <button className="download-completion-close" type="button" aria-label="关闭下载完成提示" onClick={() => setCompletedDownloadNotice(null)}><Icon name="close" size={17} /></button>
+              </div>}
               <div className="table-toolbar">
                 <div className="task-toolbar-main">
                   <div className="filters" aria-label="下载筛选">
@@ -3438,6 +3977,23 @@ export default function App() {
         ) : page === 'videos' || page === 'audio' ? (
           <section className={selectedLibraryKey ? 'video-workspace has-detail' : 'video-workspace'}>
             <div className="table-area">
+              {page === 'videos' && (continueWatching.continuing.length > 0 || continueWatching.next_up.length > 0) && <section className="continue-watching" aria-labelledby="continue-watching-title">
+                <div className="continue-watching-heading">
+                  <div><p className="eyebrow">个人播放进度</p><h2 id="continue-watching-title">继续观看</h2></div>
+                  <span>{continueWatching.continuing.length > 0 ? `${continueWatching.continuing.length} 个看到一半` : '接着看下一集'}</span>
+                </div>
+                <div className="continue-watching-list">
+                  {[...continueWatching.continuing, ...continueWatching.next_up].slice(0, 8).map((item) => {
+                    const progress = item.video.duration && item.video.watch_position > 0
+                      ? Math.min(100, Math.round(item.video.watch_position / item.video.duration * 100))
+                      : 0
+                    return <button key={`${item.reason}-${item.video.id}`} type="button" onClick={() => openPlayer(item.video)} disabled={!item.video.file_exists}>
+                      <span className="continue-cover"><img src={item.video.thumbnail || videoPlaceholder} alt="" onError={(event) => { event.currentTarget.onerror = null; event.currentTarget.src = videoPlaceholder }} /><i><Icon name="play" size={16} /></i></span>
+                      <span className="continue-copy"><small>{item.reason === 'next' ? `${item.playlist_title || '当前合集'} · 下一集` : `已看 ${progress}%`}</small><b title={item.video.title || undefined}>{item.video.title || '未命名视频'}</b>{item.reason === 'continue' && <span className="continue-progress"><i style={{ width: `${progress}%` }} /></span>}</span>
+                    </button>
+                  })}
+                </div>
+              </section>}
               <div className="video-library-toolbar">
                 <label className="title-search-field">
                   <span className="sr-only">按标题搜索{page === 'audio' ? '音频' : '视频或合集'}</span>
@@ -3552,6 +4108,9 @@ export default function App() {
                         <button type="button" role="menuitem" onClick={() => prepareVideoRename(selectedVideo)}>重命名</button>
                         <button type="button" role="menuitem" disabled={!selectedVideo.file_path} onClick={() => { closeVideoDetailMenu(true); void copyVideoFilePath(selectedVideo) }}>复制文件路径</button>
                         <button type="button" role="menuitem" disabled={!selectedVideo.file_exists} onClick={() => { closeVideoDetailMenu(true); void revealVideo(selectedVideo) }}>打开文件位置</button>
+                        {page === 'videos' && <button type="button" role="menuitem" disabled={!selectedVideo.file_exists} onClick={() => { closeVideoDetailMenu(true); void openExternalPlayer(selectedVideo, 'system') }}>用系统播放器打开</button>}
+                        {page === 'videos' && <button type="button" role="menuitem" disabled={!selectedVideo.file_exists} onClick={() => { closeVideoDetailMenu(true); void openExternalPlayer(selectedVideo, 'iina') }}>用 IINA 打开</button>}
+                        {page === 'videos' && selectedVideo.file_origin === 'downloaded' && <button type="button" role="menuitem" disabled={!selectedVideo.file_exists} onClick={() => prepareVideoUpgrade(selectedVideo)}>检查更高画质</button>}
                         <button type="button" role="menuitem" className="is-danger" onClick={() => { closeVideoDetailMenu(false); prepareVideoDelete(selectedVideo) }}><Icon name="trash" size={15} />删除{page === 'audio' ? '音频' : '视频'}</button>
                       </div>}
                       <button ref={videoDetailCloseRef} className="video-detail-close icon-button" type="button" onClick={closeLibraryDetail} aria-label={`关闭${page === 'audio' ? '音频' : '视频'}详情`}><Icon name="close" size={18} /></button>
@@ -3559,6 +4118,7 @@ export default function App() {
                   </header>
                   {selectedVideo && <>
                     {!selectedVideo.file_exists && <div className="missing-file-notice" role="status"><span>本地文件不存在。文件可能已被外部移动或删除。</span><button type="button" className="cancel-button" onClick={() => void selectAndRelinkVideo(selectedVideo)} disabled={relinkingVideoId === selectedVideo.id}>{relinkingVideoId === selectedVideo.id ? '正在重新定位…' : '重新定位文件'}</button></div>}
+                    {selectedVideo.upgrade_from_id && <div className="missing-file-notice upgrade-finalize-notice" role="status"><span>更高画质版本已下载完成。确认新文件可用后，再决定是否保留旧版。</span><div><button type="button" className="cancel-button" disabled={upgradeWorking} onClick={() => void finalizeVideoUpgrade(false)}>保留两份</button><button type="button" className="delete-button" disabled={upgradeWorking} onClick={() => void finalizeVideoUpgrade(true)}>{upgradeWorking ? '正在处理…' : '用新版替换旧版'}</button></div></div>}
                     {videoActionNotice && <p className="notice" role="status">{videoActionNotice}</p>}
                     <section className="detail-section">
                       <div className="detail-section-heading"><h3>媒体信息</h3><span>{dateLabel(selectedVideo.created_at)} 保存</span></div>
@@ -3606,6 +4166,7 @@ export default function App() {
                     <div className="detail-section-heading"><h3>来源</h3></div>
                     <div className="detail-link"><span>原始链接</span><a href={selectedPlaylist.source_url} target="_blank" rel="noreferrer">打开原合集 ↗</a></div>
                     <div className="detail-link"><span>平台合集 ID</span><code>{selectedPlaylist.external_id || '—'}</code></div>
+                    <button className="cancel-button follow-collection-button" type="button" onClick={() => openSourceFollows(selectedPlaylist.source_url)}>关注此合集的更新</button>
                   </section>
                 </>}
               </aside>
@@ -3628,6 +4189,7 @@ export default function App() {
                     <label><span><b>单任务下载限速（KB/s）</b><small>对三个下载引擎生效；填写 0 表示不限速。</small></span><input type="number" min="0" max="1000000" value={settingsDraft.download_rate_limit_kbps} onChange={(event) => setSettingsDraft({ ...settingsDraft, download_rate_limit_kbps: Math.max(0, Number(event.target.value) || 0) })} /></label>
                     <label><span><b>完成后保留空间（MB）</b><small>创建任务和真正开始前都会检查；预计文件大小之外还需保留这部分空间。</small></span><input type="number" min="0" max="1000000" value={settingsDraft.minimum_free_space_mb} onChange={(event) => setSettingsDraft({ ...settingsDraft, minimum_free_space_mb: Math.max(0, Number(event.target.value) || 0) })} /></label>
                     <label><span><b>媒体目录</b><small>每行填写一个绝对路径。点击扫描后递归添加其中尚未入库的视频和音频。</small></span><textarea value={settingsDraft.library_dirs.join('\n')} onChange={(event) => setSettingsDraft({ ...settingsDraft, library_dirs: event.target.value.split('\n') })} placeholder={'/Users/你的用户名/Movies\n/Volumes/Video'} rows={3} /></label>
+                    <label className="friendly-switch"><span><b>启动时增量扫描媒体目录</b><small>在后台只添加尚未入库的媒体，不复制源文件；目录不可访问时只记录失败。</small></span><input type="checkbox" checked={settingsDraft.scan_library_on_startup} onChange={(event) => setSettingsDraft({ ...settingsDraft, scan_library_on_startup: event.target.checked })} /></label>
                     <label className="friendly-switch"><span><b>保存封面</b><small>同时保存视频封面图片。</small></span><input type="checkbox" checked={settingsDraft.write_thumbnail} onChange={(event) => setSettingsDraft({ ...settingsDraft, write_thumbnail: event.target.checked })} /></label>
                     <label className="friendly-switch"><span><b>保存媒体信息</b><small>同时保存媒体信息 JSON 文件。</small></span><input type="checkbox" checked={settingsDraft.write_info_json} onChange={(event) => setSettingsDraft({ ...settingsDraft, write_info_json: event.target.checked })} /></label>
                     <label className="friendly-switch"><span><b>macOS 系统通知</b><small>下载完成或失败时发送本机通知；关闭应用网页后仍可通知。</small></span><input type="checkbox" checked={settingsDraft.system_notifications} onChange={(event) => setSettingsDraft({ ...settingsDraft, system_notifications: event.target.checked })} /></label>
@@ -3637,8 +4199,9 @@ export default function App() {
                     {libraryScanReport.possible_moves.length > 0 && <section><b>疑似移动 · {libraryScanReport.possible_moves.length}</b><ul>{libraryScanReport.possible_moves.map((item) => <li key={item.id}>{item.title || '未命名媒体'}<small>{item.old_path} → {item.candidate_path}</small></li>)}</ul></section>}
                     {libraryScanReport.failed.length > 0 && <section><b>扫描失败 · {libraryScanReport.failed.length}</b><ul>{libraryScanReport.failed.map((item) => <li key={item.path}>{item.path}<small>{item.error}</small></li>)}</ul></section>}
                   </div>}
-                  <footer className="tab-save-footer">{settingsNotice ? <p className="settings-notice" role="status">{settingsNotice}</p> : <span>媒体目录只会在手动扫描时读取。</span>}<div className="settings-footer-actions"><button className="cancel-button" type="button" onClick={() => void scanLibrary()} disabled={libraryScanWorking || savingSettings !== null || !settingsDraft.download_dir.trim()}>{libraryScanWorking ? '正在扫描…' : '保存并扫描媒体目录'}</button><button className="primary-button" type="button" onClick={() => saveSettings('general')} disabled={libraryScanWorking || savingSettings !== null || !settingsDraft.download_dir.trim()}>{savingSettings === 'general' ? '正在保存…' : '保存通用设置'}</button></div></footer>
+                  <footer className="tab-save-footer">{settingsNotice ? <p className="settings-notice" role="status">{settingsNotice}</p> : <span>{settingsDraft.scan_library_on_startup ? '下次启动会在后台增量扫描媒体目录。' : '媒体目录只会在手动扫描时读取。'}</span>}<div className="settings-footer-actions"><button className="cancel-button" type="button" onClick={() => void scanLibrary()} disabled={libraryScanWorking || savingSettings !== null || !settingsDraft.download_dir.trim()}>{libraryScanWorking ? '正在扫描…' : '保存并扫描媒体目录'}</button><button className="primary-button" type="button" onClick={() => saveSettings('general')} disabled={libraryScanWorking || savingSettings !== null || !settingsDraft.download_dir.trim()}>{savingSettings === 'general' ? '正在保存…' : '保存通用设置'}</button></div></footer>
                 </section>}
+
 
                 {settingsTab === 'yt-dlp' && <section className="general-settings engine-simple-settings" role="tabpanel">
                   <header><p className="eyebrow">下载引擎</p><h2>yt-dlp 下载设置</h2><p>仅保留当前网页视频下载会用到的选项。</p></header>
@@ -3705,7 +4268,7 @@ export default function App() {
                     <div><h3>恢复备份</h3><p>先选择备份文件并预览。恢复使用单一事务，失败时不会覆盖当前数据；进行中的下载会阻止恢复。</p></div>
                     <label className="backup-file-picker"><span>{backupFileName || '尚未选择备份文件'}</span><input type="file" accept="application/json,.json" disabled={backupWorking} onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ''; if (file) void previewBackupFile(file) }} /><b>{backupWorking ? '正在校验…' : '选择备份文件'}</b></label>
                     {backupPreview && <div className="backup-preview" role="status">
-                      <dl><div><dt>媒体与任务</dt><dd>{backupPreview.counts.downloads}</dd></div><div><dt>合集</dt><dd>{backupPreview.counts.playlists}</dd></div><div><dt>下载日志</dt><dd>{backupPreview.counts.download_logs}</dd></div><div><dt>设置项</dt><dd>{backupPreview.counts.app_settings}</dd></div></dl>
+                      <dl><div><dt>媒体与任务</dt><dd>{backupPreview.counts.downloads}</dd></div><div><dt>合集</dt><dd>{backupPreview.counts.playlists}</dd></div><div><dt>关注源</dt><dd>{backupPreview.counts.source_follows}</dd></div><div><dt>处理记录</dt><dd>{backupPreview.counts.media_derivative_jobs}</dd></div><div><dt>下载日志</dt><dd>{backupPreview.counts.download_logs}</dd></div><div><dt>设置项</dt><dd>{backupPreview.counts.app_settings}</dd></div></dl>
                       <p>备份时间：{backupPreview.created_at ? dateLabel(backupPreview.created_at) : '未知'}；引用的媒体文件中有 {backupPreview.missing_media_files} 个当前不存在。备份本身不包含媒体文件。</p>
                       <label className="delete-file-option"><input type="checkbox" checked={backupRestoreConfirmed} onChange={(event) => setBackupRestoreConfirmed(event.target.checked)} /><span><b>我已核对预览，确认用此备份替换当前应用数据</b><small>视频和音频文件不会被删除、复制或移动。</small></span></label>
                     </div>}
@@ -3784,6 +4347,41 @@ export default function App() {
         </div>
       )}
 
+      {sourceFollowOpen && (
+        <div className="modal-backdrop source-follow-backdrop" onMouseDown={() => { if (!sourceFollowWorking) setSourceFollowOpen(false) }}>
+          <section className="source-follow-modal" role="dialog" aria-modal="true" aria-labelledby="source-follow-title" onMouseDown={(event) => event.stopPropagation()}>
+            <header className="modal-heading">
+              <div><p className="eyebrow">个人更新订阅</p><h2 id="source-follow-title">关注频道与合集</h2><p>每次启动只检查更新，不会自动下载；确认选择后才创建任务。</p></div>
+              <button className="icon-button" type="button" onClick={() => setSourceFollowOpen(false)} disabled={Boolean(sourceFollowWorking)} aria-label="关闭"><Icon name="close" size={18} /></button>
+            </header>
+            <form className="source-follow-add" onSubmit={addSourceFollow}>
+              <label htmlFor="source-follow-url">频道、合集或播放列表地址</label>
+              <div><input id="source-follow-url" type="url" value={sourceFollowUrl} onChange={(event) => setSourceFollowUrl(event.target.value)} placeholder="https://…" autoFocus={sourceFollows.length === 0} /><button className="primary-button" type="submit" disabled={Boolean(sourceFollowWorking) || !sourceFollowUrl.trim()}>{sourceFollowWorking === 'add' ? '正在读取…' : '添加关注'}</button></div>
+            </form>
+            <div className={`source-follow-workspace${sourceFollows.length === 0 ? ' is-empty' : ''}`}>
+              {sourceFollows.length === 0 ? <section className="source-follow-onboarding"><span><Icon name="repeat" size={24} /></span><b>还没有关注源</b><p>在上方粘贴频道、合集或播放列表地址，添加后会在这里显示尚未下载的新视频。</p></section> : <>
+                <nav className="source-follow-list" aria-label="已关注来源">
+                  {sourceFollows.map((follow) => <button key={follow.id} type="button" className={activeSourceFollowId === follow.id ? 'is-active' : ''} onClick={() => { setActiveSourceFollowId(follow.id); setSelectedFollowEntryUrls(follow.entries.map((entry) => entry.webpage_url)); setSourceFollowNotice(null) }}><span className="source-follow-cover"><img src={follow.thumbnail || videoPlaceholder} alt="" onError={(event) => { event.currentTarget.onerror = null; event.currentTarget.src = videoPlaceholder }} /></span><span><b>{follow.title}</b><small>{follow.last_error ? '上次检查失败' : follow.new_count ? `${follow.new_count} 个新增` : '没有新增'}</small></span>{follow.new_count > 0 && <i>{follow.new_count}</i>}</button>)}
+                </nav>
+                <section className="source-follow-detail">
+                {activeSourceFollow ? <>
+                  <header><div><p className="eyebrow">{activeSourceFollow.source_platform || '视频来源'}</p><h3>{activeSourceFollow.title}</h3><span>{activeSourceFollow.uploader || '未知作者'} · {activeSourceFollow.last_checked_at ? `${dateLabel(activeSourceFollow.last_checked_at)} 检查` : '尚未检查'}</span></div><div><button className="cancel-button" type="button" onClick={() => void checkSourceFollow(activeSourceFollow)} disabled={Boolean(sourceFollowWorking)}>{sourceFollowWorking === `check:${activeSourceFollow.id}` ? '检查中…' : '检查更新'}</button><button className="text-button is-danger" type="button" onClick={() => void deleteSourceFollow(activeSourceFollow)} disabled={Boolean(sourceFollowWorking)}>取消关注</button></div></header>
+                  <label className="friendly-switch source-follow-startup"><span><b>启动时检查</b><small>只读取更新列表，不自动下载。</small></span><input type="checkbox" checked={activeSourceFollow.check_on_startup} onChange={() => void toggleSourceFollowStartup(activeSourceFollow)} disabled={Boolean(sourceFollowWorking)} /></label>
+                  {activeSourceFollow.last_error && <p className="notice is-error" role="status">上次检查失败：{activeSourceFollow.last_error}</p>}
+                  {activeSourceFollow.entries.length > 0 ? <>
+                    <div className="source-follow-selection"><label><input type="checkbox" checked={selectedFollowEntryUrls.length === activeSourceFollow.entries.length} onChange={(event) => setSelectedFollowEntryUrls(event.target.checked ? activeSourceFollow.entries.map((entry) => entry.webpage_url) : [])} />全选新增视频</label><span>已选 {selectedFollowEntryUrls.length} / {activeSourceFollow.entries.length}</span></div>
+                    <ol className="source-follow-entries">{activeSourceFollow.entries.map((entry) => <li key={entry.webpage_url}><label><input type="checkbox" checked={selectedFollowEntryUrls.includes(entry.webpage_url)} onChange={(event) => setSelectedFollowEntryUrls((current) => event.target.checked ? [...current, entry.webpage_url] : current.filter((url) => url !== entry.webpage_url))} /><span className="source-follow-entry-cover"><img src={entry.thumbnail || videoPlaceholder} alt="" onError={(event) => { event.currentTarget.onerror = null; event.currentTarget.src = videoPlaceholder }} /></span><span><b>{entry.title}</b><small>第 {entry.playlist_index} 个 · {durationLabel(entry.duration)}</small></span></label></li>)}</ol>
+                    <button className="primary-button source-follow-download" type="button" onClick={() => void downloadFollowEntries(activeSourceFollow)} disabled={Boolean(sourceFollowWorking) || selectedFollowEntryUrls.length === 0}>{sourceFollowWorking === `download:${activeSourceFollow.id}` ? '正在创建任务…' : `下载已选 ${selectedFollowEntryUrls.length} 个`}</button>
+                  </> : <div className="source-follow-detail-empty"><Icon name="check" size={25} /><b>目前没有新增视频</b><span>本地已完成和正在下载的内容都会自动排除。</span></div>}
+                </> : <div className="source-follow-detail-empty"><Icon name="repeat" size={25} /><b>选择一个关注源</b><span>这里会显示尚未下载的新视频。</span></div>}
+                </section>
+              </>}
+            </div>
+            {sourceFollowNotice && <p className="notice source-follow-notice" role="status">{sourceFollowNotice}</p>}
+          </section>
+        </div>
+      )}
+
       {resourceSearchOpen && (
         <div className="modal-backdrop resource-search-backdrop" onMouseDown={closeResourceSearch}>
           <section className="resource-search-modal" role="dialog" aria-modal="true" aria-labelledby="resource-search-title" onMouseDown={(event) => event.stopPropagation()}>
@@ -3848,14 +4446,17 @@ export default function App() {
               {batchUrls.length > 1 && <p className="input-help">已识别 {batchUrls.length} 个链接，将逐条解析并使用当前下载设置创建任务；批量模式自动选择各链接的最佳格式。</p>}
               <div className="download-alternate-input"><span>或</span><label className="torrent-file-picker"><input type="file" accept=".torrent,application/x-bittorrent" aria-label="上传 .torrent 文件" onChange={(event) => chooseTorrentFile(event.target.files?.[0])} /><b>{torrentFile ? torrentFile.name : '上传 .torrent 文件'}</b></label>{torrentFile && <button type="button" className="text-button" onClick={() => { setTorrentFile(null); setEngineHint('auto') }}>移除</button>}</div>
             </form>
-            <fieldset className="option-selector" aria-describedby="download-priority-help">
-              <legend>任务优先级</legend>
-              <div className="option-selector-grid priority-selector-grid">
-                {downloadPriorityOptions.map((option) => <label key={option.value}><input type="radio" name="download-priority" value={option.value} checked={downloadPriority === option.value} onChange={() => setDownloadPriority(option.value)} /><span className="option-selector-choice"><b>{option.label}</b><small>{option.hint}</small></span></label>)}
-              </div>
-              <small id="download-priority-help">只影响尚未开始的任务；同优先级按创建顺序执行。</small>
-            </fieldset>
-            {notice && <p className="notice" role="status">{notice}</p>}
+            <details className="download-options">
+              <summary><span>下载选项</span><small>优先级：{priorityLabel(downloadPriority)}</small></summary>
+              <fieldset className="option-selector" aria-describedby="download-priority-help">
+                <legend>任务优先级</legend>
+                <div className="option-selector-grid priority-selector-grid">
+                  {downloadPriorityOptions.map((option) => <label key={option.value}><input type="radio" name="download-priority" value={option.value} checked={downloadPriority === option.value} onChange={() => setDownloadPriority(option.value)} /><span className="option-selector-choice"><b>{option.label}</b><small>{option.hint}</small></span></label>)}
+                </div>
+                <small id="download-priority-help">只影响尚未开始的任务；同优先级按创建顺序执行。</small>
+              </fieldset>
+            </details>
+            {notice && <div className="notice download-notice" role="status"><span>{notice}</span>{notice.includes('已下载') && <button type="button" onClick={() => { closeModal(); openLibraryPage('videos') }}>查看视频</button>}</div>}
             {media && (media.kind === 'video' || media.kind === 'playlist') && (
               <div className="inspect-result">
                 <div className={`media-cover${media.thumbnail ? '' : ' is-fallback'}`}><img src={media.thumbnail || videoPlaceholder} alt="" referrerPolicy="no-referrer" onError={(event) => { event.currentTarget.onerror = null; event.currentTarget.closest('.media-cover')?.classList.add('is-fallback'); event.currentTarget.src = videoPlaceholder }} /><span className="cover-fallback-reason">封面暂时无法显示</span></div>
@@ -3892,8 +4493,28 @@ export default function App() {
               <div className="media-facts"><span>{media.source_type === 'magnet' ? '磁力链接' : media.source_type === 'torrent_file' ? '种子文件' : media.source_type === 'thunder_bt' ? '迅雷 BT 链接' : '种子地址'}</span><span>{`${torrentMediaFiles.length} 个视频或音频`}</span><span>{fileSizeLabel(torrentMediaSize)}</span></div>
               {media.message && <p>{media.message}</p>}
               {torrentMediaFiles.length > 1 ? <>
-                <div className="torrent-selection-bar"><label><input type="checkbox" checked={selectedTorrentFileIndexes.length === torrentMediaFiles.length} onChange={(event) => setSelectedTorrentFileIndexes(event.target.checked ? torrentMediaFiles.map((file) => file.index) : [])} />全选</label><span>已选 {selectedTorrentFileIndexes.length} / {torrentMediaFiles.length} 个</span></div>
-                <ol className="torrent-preview-list torrent-select-list">{torrentMediaFiles.map((file) => <li key={file.index}><label><input type="checkbox" checked={selectedTorrentFileIndexes.includes(file.index)} onChange={() => toggleTorrentFile(file.index)} /><span>{file.path}</span><b>{fileSizeLabel(file.size)}</b></label></li>)}</ol>
+                <section className="torrent-picker" aria-label="选择要下载的媒体文件">
+                  <header className="torrent-selection-bar">
+                    <label><input type="checkbox" checked={selectedTorrentFileIndexes.length === torrentMediaFiles.length} onChange={(event) => setSelectedTorrentFileIndexes(event.target.checked ? torrentMediaFiles.map((file) => file.index) : [])} />全选媒体文件</label>
+                    <span><b>已选 {selectedTorrentFileIndexes.length} / {torrentMediaFiles.length}</b><small>{fileSizeLabel(selectedTorrentMediaSize)}</small></span>
+                  </header>
+                  <label className="torrent-search-field" htmlFor="torrent-file-search">
+                    <span>搜索文件</span>
+                    <input id="torrent-file-search" type="search" value={torrentFileQuery} onChange={(event) => { setTorrentFileQuery(event.target.value); setTorrentVisibleFileCount(torrentVisibleFileStep) }} placeholder="输入文件名或目录" autoComplete="off" />
+                  </label>
+                  <div className="torrent-group-list">
+                    {visibleTorrentFileGroups.map((group) => {
+                      const groupIndexes = group.files.map((file) => file.index)
+                      const groupSelected = groupIndexes.every((index) => selectedTorrentFileIndexes.includes(index))
+                      return <section className="torrent-file-group" key={group.name}>
+                        <header><span><b>{group.name}</b><small>{group.files.length} 个媒体文件</small></span><button type="button" aria-pressed={groupSelected} onClick={() => toggleTorrentGroup(groupIndexes)}>{torrentFileQuery.trim() ? (groupSelected ? '取消匹配项' : '选择匹配项') : (groupSelected ? '取消目录' : '选择目录')}</button></header>
+                        <ul>{group.visibleFiles.map((file) => <li key={file.index} className={selectedTorrentFileIndexes.includes(file.index) ? 'is-selected' : ''}><label><input type="checkbox" checked={selectedTorrentFileIndexes.includes(file.index)} onChange={() => toggleTorrentFile(file.index)} /><span title={file.path}>{torrentFileLabel(file.path, group.name)}</span><b>{fileSizeLabel(file.size)}</b></label></li>)}</ul>
+                      </section>
+                    })}
+                    {filteredTorrentMediaFiles.length === 0 && <p className="torrent-search-empty" role="status">没有匹配的媒体文件，换一个文件名或目录关键词再试。</p>}
+                  </div>
+                  {filteredTorrentMediaFiles.length > torrentVisibleFileCount && <footer className="torrent-list-footer"><span>已显示 {torrentVisibleFileCount} / {filteredTorrentMediaFiles.length} 个匹配文件</span><button type="button" onClick={() => setTorrentVisibleFileCount((count) => count + torrentVisibleFileStep)}>显示更多</button></footer>}
+                </section>
                 <p className="input-help">仅下载已选视频或音频；{media.engine === 'qbittorrent' ? 'qBittorrent' : 'aria2'} 会继续连接可用节点或 Web Seed。</p>
               </> : torrentMediaFiles.length === 1 ? <p className="input-help">已排除非音视频文件，仅下载这个媒体文件。</p> : <p className="notice">种子中没有可下载的视频或音频文件。</p>}
               <button type="button" className="primary-button" onClick={() => void createDownload()} disabled={working || torrentMediaFiles.length === 0 || selectedTorrentFileIndexes.length === 0}>{torrentMediaFiles.length > 1 ? (selectedTorrentFileIndexes.length === torrentMediaFiles.length ? `下载全部 ${torrentMediaFiles.length} 个媒体文件` : `下载已选 ${selectedTorrentFileIndexes.length} 个媒体文件`) : torrentMediaFiles.length === 1 ? `下载 ${torrentMediaFiles[0].path}` : '没有可下载的视频或音频'}</button>
@@ -3934,7 +4555,7 @@ export default function App() {
         <div className="modal-backdrop inspect-progress-backdrop" onMouseDown={() => setInspectProgressOpen(false)}>
           <section className="inspect-progress-modal" role="dialog" aria-modal="true" aria-labelledby="inspect-progress-title" onMouseDown={(event) => event.stopPropagation()}>
             <header>
-              <div><p className="eyebrow">链接解析</p><h2 id="inspect-progress-title">{inspectStatusLabel(inspectJob.status)}</h2><p>{inspectJob.status === 'running' ? `正在识别下载类型并读取内容信息，${elapsedLabel(inspectJob.started_at)}。` : inspectJob.status === 'failed' ? '请检查链接是否仍可访问，或改用其他下载方式。' : '正在等待解析服务开始。'}</p></div>
+              <div><p className="eyebrow">链接解析</p><h2 id="inspect-progress-title">{inspectStatusLabel(inspectJob.status)}</h2><p>{inspectJob.status === 'running' ? `正在识别下载类型并读取内容信息，${elapsedLabel(inspectJob.started_at)}。` : inspectJob.status === 'completed' ? '解析完成，可以确认下载。' : inspectJob.status === 'failed' ? '请检查链接是否仍可访问，或改用其他下载方式。' : '正在等待解析服务开始。'}</p></div>
               <div className="inspect-progress-actions"><span className={`inspect-status is-${inspectJob.status}`}>{inspectStatusLabel(inspectJob.status)}</span><button className="icon-button" type="button" onClick={() => setInspectProgressOpen(false)} aria-label="关闭解析进度"><Icon name="close" /></button></div>
             </header>
             <div className="inspect-log-region"><div className="inspect-log-heading"><span>解析记录</span></div><ol className="inspect-log-list" ref={inspectLogRef} aria-live="polite">
@@ -3966,6 +4587,39 @@ export default function App() {
             </div>}
             {outputPlayerNotice && <p className="notice" role="status">{outputPlayerNotice}</p>}
             <footer><span>正在播放任务的原始输出文件，不会转码。</span><div><button className="cancel-button" onClick={() => void revealTaskOutput(outputPlayer.task, outputPlayer.output)}>打开文件位置</button><button className="cancel-button" onClick={() => setOutputPlayer(null)}>关闭播放器</button></div></footer>
+          </section>
+        </div>
+      )}
+
+      {legalModal && (
+        <div className="modal-backdrop legal-backdrop" onMouseDown={() => setLegalModal(null)}>
+          <section className="legal-modal" role="dialog" aria-modal="true" aria-labelledby="legal-modal-title" onMouseDown={(event) => event.stopPropagation()}>
+            <header>
+              <div><p className="eyebrow">{legalModal === 'open-source' ? 'OPEN SOURCE' : 'LOCAL USE'}</p><h2 id="legal-modal-title">{legalModal === 'open-source' ? '开源软件与致谢' : '使用与免责说明'}</h2></div>
+              <button className="icon-button" type="button" onClick={() => setLegalModal(null)} aria-label="关闭"><Icon name="close" size={18} /></button>
+            </header>
+            {legalModal === 'open-source' ? <>
+              <p className="legal-intro">Video Downloader 是一个本地界面与任务管理层。感谢以下项目的作者和贡献者；各项目的著作权及许可仍归原权利人，本项目不会改变其原许可证。</p>
+              <div className="legal-component-list">
+                <article><div><b>yt-dlp</b><code>{health?.engine_version || '未检测到'}</code></div><p>网页媒体解析与下载 · The Unlicense</p><a href="https://github.com/yt-dlp/yt-dlp" target="_blank" rel="noreferrer">项目与许可证 ↗</a></article>
+                <article><div><b>FFmpeg</b><code>{health?.ffmpeg_version || '未检测到'}</code></div><p>音视频合并与转码 · LGPL-2.1-or-later；启用 GPL 组件的构建适用 GPL</p><a href="https://ffmpeg.org/legal.html" target="_blank" rel="noreferrer">许可证说明 ↗</a></article>
+                <article><div><b>aria2</b><code>{health?.engines?.aria2.version || '未检测到'}</code></div><p>直链、迅雷链接与 BT 下载 · GPL-2.0-or-later</p><a href="https://github.com/aria2/aria2" target="_blank" rel="noreferrer">项目与许可证 ↗</a></article>
+                <article><div><b>qBittorrent</b><code>{health?.engines?.qbittorrent.version || '未连接（可选）'}</code></div><p>可选 BT 客户端连接 · GPL-2.0</p><a href="https://github.com/qbittorrent/qBittorrent" target="_blank" rel="noreferrer">项目与许可证 ↗</a></article>
+                <article><div><b>FastAPI</b><code>{health?.application?.fastapi_version || '未检测到'}</code></div><p>本地 HTTP API · MIT</p><a href="https://github.com/fastapi/fastapi" target="_blank" rel="noreferrer">项目与许可证 ↗</a></article>
+                <article><div><b>Uvicorn</b><code>{health?.application?.uvicorn_version || '未检测到'}</code></div><p>本地 ASGI 服务 · BSD-3-Clause</p><a href="https://github.com/Kludex/uvicorn" target="_blank" rel="noreferrer">项目与许可证 ↗</a></article>
+                <article><div><b>React / React DOM</b><code>19.2.8</code></div><p>用户界面 · MIT</p><a href="https://github.com/facebook/react" target="_blank" rel="noreferrer">项目与许可证 ↗</a></article>
+                <article><div><b>Plyr</b><code>3.8.4</code></div><p>视频播放器界面 · MIT</p><a href="https://github.com/sampotts/plyr" target="_blank" rel="noreferrer">项目与许可证 ↗</a></article>
+                <article><div><b>WaveSurfer.js</b><code>7.12.11</code></div><p>音频波形播放器 · BSD-3-Clause</p><a href="https://github.com/katspaugh/wavesurfer.js" target="_blank" rel="noreferrer">项目与许可证 ↗</a></article>
+              </div>
+              <p className="legal-footnote">这里显示后端实际检测到的工具版本和前端锁定版本。完整的直接依赖、传递依赖与发行义务记录在仓库的 <code>THIRD_PARTY_NOTICES.md</code>。</p>
+            </> : <div className="disclaimer-copy">
+              <section><h3>本地运行</h3><p>本软件是开源下载工具的本地界面与任务管理层。下载、解析和播放请求从你的设备直接发往相应来源；项目作者不运营媒体下载服务，也不会接收、托管或保存你下载的媒体。</p></section>
+              <section><h3>不内置媒体内容</h3><p>软件包不附带视频、音频、磁力链接或种子文件。下载对象来自你输入的链接，或你主动使用资源搜索时从上游取得的结果。</p></section>
+              <section><h3>仅限合法使用</h3><p>请只下载或播放你拥有权利、已经获得授权、属于公有领域，或来源平台明确允许下载的内容。你需要自行遵守所在地法律、内容权利人的授权条件和第三方平台条款，并对所提交链接、下载内容及后续使用负责。</p></section>
+              <section><h3>第三方关系与可用性</h3><p>本项目与 YouTube、Bilibili 及其他内容平台不存在隶属、授权或背书关系。上游接口、链接、频道、地区限制和登录要求可能随时变化，本项目不保证其持续可用、准确或适合特定用途。</p></section>
+              <section><h3>责任边界</h3><p>在适用法律允许的范围内，项目作者不对用户未经授权的下载、传播、公开播放或其他侵权行为，以及由第三方来源失效、数据错误或本地文件损失造成的损害承担责任。法律规定不得排除或限制的责任不受本说明影响。</p></section>
+            </div>}
+            <footer><span>Video Downloader {health?.application?.version || '0.1.0'}</span><button className="primary-button" type="button" onClick={() => setLegalModal(null)}>我已阅读</button></footer>
           </section>
         </div>
       )}
@@ -4012,6 +4666,17 @@ export default function App() {
                 </select>
               </label>
             )}
+            {currentPlayerMediaType === 'video' && videoCompatibility && <section className={`player-compatibility${videoCompatibility.direct_play_likely ? ' is-compatible' : ''}`} aria-label="播放兼容性">
+              <div><b>{videoCompatibility.direct_play_likely ? '内置播放兼容' : '播放兼容性建议'}</b><span>{videoCompatibility.reason}</span><small>{videoCompatibility.container || '未知封装'} · {videoCompatibility.video_codec?.toUpperCase() || '未知视频编码'}{videoCompatibility.audio_codec ? ` / ${videoCompatibility.audio_codec.toUpperCase()}` : ''}</small></div>
+              <div className="player-compatibility-actions">
+                {videoCompatibility.players.system && <button className="cancel-button" type="button" onClick={() => void openExternalPlayer(playerVideo, 'system')} disabled={Boolean(compatibilityWorking)}>系统播放器</button>}
+                {videoCompatibility.players.iina && <button className="cancel-button" type="button" onClick={() => void openExternalPlayer(playerVideo, 'iina')} disabled={Boolean(compatibilityWorking)}>IINA</button>}
+                {videoCompatibility.players.vlc && <button className="cancel-button" type="button" onClick={() => void openExternalPlayer(playerVideo, 'vlc')} disabled={Boolean(compatibilityWorking)}>VLC</button>}
+                {videoCompatibility.remux_available && compatibilityJob?.status !== 'completed' && <button className="primary-button" type="button" onClick={() => void startCompatibilityRemux(playerVideo)} disabled={Boolean(compatibilityWorking) || Boolean(compatibilityJob && ['queued', 'running'].includes(compatibilityJob.status))}>{compatibilityWorking === 'remux' ? '正在创建…' : compatibilityJob && ['queued', 'running'].includes(compatibilityJob.status) ? '正在生成兼容副本…' : '生成 MP4 兼容副本'}</button>}
+              </div>
+              {compatibilityJob?.status === 'failed' && <p className="notice is-error" role="status">兼容副本生成失败：{compatibilityJob.error || '未知错误'}</p>}
+              {compatibilityJob?.status === 'completed' && <p className="notice" role="status">兼容副本已加入视频管理，原始文件保持不变。</p>}
+            </section>}
             {playlistVideos.length > 0 && (
               <section className="player-playlist" aria-label="播放列表">
                 <div className="player-playlist-heading"><div><b>播放列表</b><span>{playerPlaylistPosition + 1} / {playlistVideos.length}</span></div><div><button type="button" className="cancel-button" onClick={() => previousPlaylistVideo && playPlaylistVideo(previousPlaylistVideo)} disabled={!previousPlaylistVideo}>上一集</button><button type="button" className="play-action" onClick={() => nextPlaylistVideo && playPlaylistVideo(nextPlaylistVideo)} disabled={!nextPlaylistVideo}>下一集</button></div></div>
@@ -4112,6 +4777,22 @@ export default function App() {
             <small className="metadata-edit-help">只修改媒体库记录，不改动原始媒体文件；更换合集后会排在新合集末尾。</small>
             {metadataEditNotice && <p className="notice" role="status">{metadataEditNotice}</p>}
             <footer><button className="cancel-button" type="button" onClick={() => setMetadataEditTarget(null)} disabled={metadataEditWorking}>取消</button><button className="primary-button" type="button" onClick={() => void confirmMetadataEdit()} disabled={metadataEditWorking || metadataEditLoading}>{metadataEditWorking ? '正在保存…' : metadataEditLoading ? '正在读取合集…' : '保存媒体信息'}</button></footer>
+          </section>
+        </div>
+      )}
+
+      {upgradeTarget && (
+        <div className="modal-backdrop" onMouseDown={() => { if (!upgradeWorking) setUpgradeTarget(null) }}>
+          <section className="rename-video-modal video-upgrade-modal" role="dialog" aria-modal="true" aria-labelledby="video-upgrade-title" onMouseDown={(event) => event.stopPropagation()}>
+            <p className="eyebrow">画质升级</p>
+            <h2 id="video-upgrade-title">检查“{upgradeTarget.title || '未命名视频'}”</h2>
+            <p>当前文件：{upgradeOptions?.current_resolution || upgradeTarget.resolution || '清晰度未知'}。下载新版期间会完整保留旧文件。</p>
+            {upgradeWorking && !upgradeOptions ? <p className="notice" role="status">正在重新检查原页面可用画质…</p> : upgradeOptions && upgradeOptions.candidates.length > 0 && <label><span>选择更高画质</span><select value={upgradeFormat} onChange={(event) => setUpgradeFormat(event.target.value)}>
+              {upgradeOptions.candidates.map((format) => <option key={format.format_id} value={format.format_id}>{format.label}{format.file_size_label ? ` · 约 ${format.file_size_label}` : ''}</option>)}
+            </select></label>}
+            <small className="metadata-edit-help">新版完成后会单独出现在视频管理中；只有你再次确认，旧版才会移入 macOS 废纸篓。</small>
+            {upgradeNotice && <p className="notice" role="status">{upgradeNotice}</p>}
+            <footer><button className="cancel-button" type="button" onClick={() => setUpgradeTarget(null)} disabled={upgradeWorking}>取消</button><button className="primary-button" type="button" onClick={() => void startVideoUpgrade()} disabled={upgradeWorking || !upgradeFormat}>{upgradeWorking ? '正在处理…' : '下载更高画质'}</button></footer>
           </section>
         </div>
       )}

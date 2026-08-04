@@ -25,6 +25,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from functools import cache
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 from http.cookiejar import CookieJar
@@ -53,6 +54,7 @@ from .core.models import (
     DownloadSettingsRequest,
     DuplicateCleanupRequest,
     EngineSettingsRequest,
+    ExternalPlayerRequest,
     GeneralSettingsRequest,
     InspectRequest,
     LocalDirectoryScanRequest,
@@ -65,12 +67,17 @@ from .core.models import (
     PlaylistDownloadRequest,
     QbittorrentSettings,
     ResourceSearchRequest,
+    SourceFollowDownloadRequest,
+    SourceFollowRequest,
+    SourceFollowUpdateRequest,
     SubtitlePreferenceRequest,
     VideoFavoriteRequest,
     VideoMetadataRequest,
     VideoRelinkRequest,
     VideoRenameRequest,
     VideoWatchedRequest,
+    VideoUpgradeFinalizeRequest,
+    VideoUpgradeRequest,
     YtDlpSettingsRequest,
     YtDlpSimpleSettings,
 )
@@ -78,7 +85,17 @@ from .core.storage import connection as storage_connection
 from .core.storage import initialize_database as storage_initialize_database
 from .core.storage import now as storage_now
 from .engines import aria2, qbittorrent
-from .engines.inputs import InputError, inspect_non_ytdlp_input, is_media_file, route_input
+from .engines.inputs import (
+    InputError,
+    MAX_TORRENT_FILE_BYTES,
+    MAX_TORRENT_FILES,
+    fetch_torrent_url,
+    inspect_non_ytdlp_input,
+    inspect_torrent,
+    is_media_file,
+    magnet_info_hash,
+    route_input,
+)
 from .services.engine_tasks import run_aria2_task, run_qbittorrent_task
 
 
@@ -90,6 +107,8 @@ cancelled_downloads: set[str] = set()
 cancelled_downloads_lock = threading.Lock()
 engine_processes: dict[str, subprocess.Popen[bytes]] = {}
 engine_processes_lock = threading.Lock()
+media_job_processes: dict[str, subprocess.Popen[bytes]] = {}
+media_job_processes_lock = threading.Lock()
 MAX_CONCURRENT_DOWNLOADS = 5
 MAX_DOWNLOAD_WORKERS = 10
 download_executor = ThreadPoolExecutor(
@@ -102,6 +121,10 @@ download_queue_sequence = 0
 active_scheduled_downloads = 0
 download_scheduler_thread: threading.Thread | None = None
 INSPECT_HEARTBEAT_SECONDS = 8
+MAGNET_METADATA_CACHE_DIR = DATA_DIR / ".video-downloader" / "torrent-metadata"
+MAGNET_METADATA_CACHE_URLS = (
+    "https://itorrents.org/torrent/{info_hash}.torrent",
+)
 YT_DLP_UPDATE_CACHE_SECONDS = 3600
 yt_dlp_update_cache: dict[str, Any] | None = None
 yt_dlp_update_cache_at = 0.0
@@ -110,7 +133,15 @@ BACKUP_FORMAT = "video-downloader-backup"
 BACKUP_FORMAT_VERSION = 1
 BACKUP_MAX_BYTES = 25 * 1024 * 1024
 BACKUP_PREVIEW_TTL_SECONDS = 600
-BACKUP_TABLES = ("playlists", "downloads", "download_logs", "video_denoise_jobs", "app_settings")
+BACKUP_TABLES = (
+    "playlists",
+    "downloads",
+    "download_logs",
+    "video_denoise_jobs",
+    "media_derivative_jobs",
+    "source_follows",
+    "app_settings",
+)
 backup_previews: dict[str, dict[str, Any]] = {}
 backup_previews_lock = threading.Lock()
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -195,6 +226,8 @@ def validate_backup_payload(payload: Any) -> tuple[dict[str, Any], dict[str, Any
         "downloads": {"id"},
         "download_logs": {"id", "download_id"},
         "video_denoise_jobs": {"id", "download_id"},
+        "media_derivative_jobs": {"id", "download_id"},
+        "source_follows": {"id", "source_url"},
         "app_settings": {"key", "value"},
     }
     for table in BACKUP_TABLES:
@@ -241,7 +274,15 @@ def restore_backup_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ).fetchone()["count"]
         if active:
             raise HTTPException(status_code=409, detail="存在进行中的下载任务，请先暂停或取消后再恢复备份。")
-        for table in ("download_logs", "video_denoise_jobs", "downloads", "playlists", "app_settings"):
+        for table in (
+            "download_logs",
+            "video_denoise_jobs",
+            "media_derivative_jobs",
+            "source_follows",
+            "downloads",
+            "playlists",
+            "app_settings",
+        ):
             database.execute(f"DELETE FROM {table}")
         for table in BACKUP_TABLES:
             for row in tables[table]:
@@ -317,6 +358,7 @@ def initialize_database() -> None:
                 parent_output_index INTEGER,
                 restart_pending INTEGER NOT NULL DEFAULT 0,
                 priority INTEGER NOT NULL DEFAULT 0,
+                upgrade_from_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -353,6 +395,8 @@ def initialize_database() -> None:
             database.execute("ALTER TABLE downloads ADD COLUMN restart_pending INTEGER NOT NULL DEFAULT 0")
         if "priority" not in columns:
             database.execute("ALTER TABLE downloads ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+        if "upgrade_from_id" not in columns:
+            database.execute("ALTER TABLE downloads ADD COLUMN upgrade_from_id TEXT")
         database.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS downloads_parent_output_idx "
             "ON downloads(parent_download_id, parent_output_index)"
@@ -438,6 +482,42 @@ def initialize_database() -> None:
             )
             """
         )
+        database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_follows (
+                id TEXT PRIMARY KEY,
+                source_url TEXT NOT NULL UNIQUE,
+                source_platform TEXT,
+                title TEXT NOT NULL,
+                uploader TEXT,
+                thumbnail TEXT,
+                external_id TEXT,
+                check_on_startup INTEGER NOT NULL DEFAULT 1,
+                last_checked_at TEXT,
+                last_error TEXT,
+                entries_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_derivative_jobs (
+                id TEXT PRIMARY KEY,
+                download_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                file_path TEXT,
+                file_size INTEGER,
+                library_video_id TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(download_id) REFERENCES downloads(id)
+            )
+            """
+        )
         for key, value in DEFAULT_DOWNLOAD_SETTINGS.items():
             database.execute(
                 "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)",
@@ -459,13 +539,25 @@ def initialize_database() -> None:
             """,
             (now(),),
         )
+        database.execute(
+            """
+            UPDATE media_derivative_jobs
+            SET status = 'interrupted', error = '应用关闭，处理已停止。', updated_at = ?
+            WHERE status IN ('queued', 'running')
+            """,
+            (now(),),
+        )
 
 
 @app.on_event("startup")
 def startup() -> None:
     storage_initialize_database()
-    refresh_local_media_metadata()
     recover_restart_pending_downloads()
+    threading.Thread(
+        target=refresh_local_library_on_startup,
+        name="library-startup-scan",
+        daemon=True,
+    ).start()
     maintenance = get_download_settings()["maintenance"]
     if maintenance["auto_cleanup_enabled"]:
         try:
@@ -501,6 +593,11 @@ def shutdown() -> None:
     with engine_processes_lock:
         processes = list(engine_processes.values())
     for process in processes:
+        if process.poll() is None:
+            process.terminate()
+    with media_job_processes_lock:
+        media_processes = list(media_job_processes.values())
+    for process in media_processes:
         if process.poll() is None:
             process.terminate()
 
@@ -598,10 +695,11 @@ def normalize_library_dirs(values: list[str]) -> list[str]:
 
 
 def safe_directory_value(value: Any, fallback: str) -> str:
-    text = str(value or fallback)
-    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
-    text = re.sub(r"\s+", " ", text).strip(" .")
-    return (text or fallback)[:120].rstrip(" .")
+    def clean(candidate: Any) -> str:
+        text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(candidate or ""))
+        return re.sub(r"\s+", " ", text).strip(" .")
+
+    return (clean(value) or clean(fallback) or "未命名")[:120].rstrip(" .")
 
 
 def formatted_download_dir(
@@ -948,7 +1046,11 @@ def build_ytdlp_download_options(
 ) -> dict[str, Any]:
     tokens, options = parse_ytdlp_config(config)
 
-    if requested_format:
+    if config_has_option(tokens, "-x", "--extract-audio"):
+        # yt-dlp selects bestaudio/best for audio extraction. Do not replace it
+        # with the video format currently selected in the download dialog.
+        pass
+    elif requested_format:
         options["format"] = requested_format
     elif not options.get("format"):
         options["format"] = "bv*+ba/b"
@@ -993,6 +1095,10 @@ def get_download_settings() -> dict[str, Any]:
         "library_dirs": normalize_library_dirs(
             values.get("library_dirs", DEFAULT_DOWNLOAD_SETTINGS["library_dirs"])
         ),
+        "scan_library_on_startup": bool(
+            values.get("scan_library_on_startup", DEFAULT_DOWNLOAD_SETTINGS["scan_library_on_startup"])
+        ),
+        "last_library_scan": values.get("last_library_scan"),
         "write_thumbnail": bool(values.get("write_thumbnail", True)),
         "write_info_json": bool(values.get("write_info_json", True)),
         "max_concurrent_downloads": max(1, min(10, int(values.get("max_concurrent_downloads", 5)))),
@@ -1023,6 +1129,7 @@ def save_download_settings(request: DownloadSettingsRequest) -> dict[str, Any]:
         "download_dir": str(resolve_download_dir(request.download_dir)),
         "directory_pattern": validate_directory_pattern(request.directory_pattern),
         "library_dirs": normalize_library_dirs(request.library_dirs),
+        "scan_library_on_startup": request.scan_library_on_startup,
         "write_thumbnail": request.write_thumbnail,
         "write_info_json": request.write_info_json,
         "max_concurrent_downloads": request.max_concurrent_downloads,
@@ -1063,6 +1170,7 @@ def save_general_settings(request: GeneralSettingsRequest) -> dict[str, Any]:
             "download_dir": str(resolve_download_dir(request.download_dir)),
             "directory_pattern": validate_directory_pattern(request.directory_pattern),
             "library_dirs": normalize_library_dirs(request.library_dirs),
+            "scan_library_on_startup": request.scan_library_on_startup,
             "write_thumbnail": request.write_thumbnail,
             "write_info_json": request.write_info_json,
             "max_concurrent_downloads": request.max_concurrent_downloads,
@@ -1143,7 +1251,9 @@ def format_label(item: dict[str, Any]) -> str:
 
 def format_options(info: dict[str, Any]) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
-    for item in info.get("formats") or []:
+    # yt-dlp returns formats from lower to higher preference. The first option
+    # is selected by default in the UI, so expose the best choices first.
+    for item in reversed(info.get("formats") or []):
         if not item.get("format_id") or item.get("vcodec") == "none":
             continue
 
@@ -1500,6 +1610,10 @@ def inspect_url(url: str, logger: InspectLogger | None = None) -> dict[str, Any]
     media_formats = [info, *[item for item in formats if isinstance(item, dict)]]
     if not any(
         item.get("vcodec") not in {None, "none"} or item.get("acodec") not in {None, "none"}
+        or (
+            str(item.get("protocol") or "").startswith("m3u8")
+            and is_media_file(f"stream.{str(item.get('ext') or '').lstrip('.')}")
+        )
         for item in media_formats
     ):
         raise InputError("只支持下载视频和音频内容，其他文件类型不允许下载。")
@@ -1594,6 +1708,54 @@ def prepare_inspect_source(request: InspectRequest) -> dict[str, Any]:
     return {"url": request.url.strip(), "route": route, "torrent_data": None, "torrent_name": None}
 
 
+def cached_magnet_metadata(magnet_url: str) -> bytes | None:
+    info_hash = magnet_info_hash(magnet_url)
+    if info_hash is None:
+        return None
+    cache_path = MAGNET_METADATA_CACHE_DIR / f"{info_hash}.torrent"
+    try:
+        if not cache_path.is_file() or cache_path.stat().st_size > MAX_TORRENT_FILE_BYTES:
+            return None
+        torrent_data = cache_path.read_bytes()
+        inspected = inspect_torrent(torrent_data, cache_path.name)
+    except (InputError, OSError):
+        return None
+    return torrent_data if inspected.get("info_hash") == info_hash else None
+
+
+def cache_magnet_metadata(magnet_url: str, torrent_data: bytes) -> None:
+    info_hash = magnet_info_hash(magnet_url)
+    if info_hash is None or len(torrent_data) > MAX_TORRENT_FILE_BYTES:
+        raise InputError("磁力链接返回了无法校验的 BT 元数据。")
+    inspected = inspect_torrent(torrent_data, f"{info_hash}.torrent")
+    if inspected.get("info_hash") != info_hash:
+        raise InputError("磁力链接返回的 BT 元数据与 Info Hash 不一致，已停止解析。")
+    MAGNET_METADATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = MAGNET_METADATA_CACHE_DIR / f"{info_hash}.torrent"
+    temporary = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(torrent_data)
+        temporary.replace(cache_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def fetch_public_magnet_metadata(magnet_url: str) -> bytes | None:
+    """Fetch allowlisted public metadata and accept it only after hash validation."""
+    info_hash = magnet_info_hash(magnet_url)
+    if info_hash is None:
+        return None
+    for template in MAGNET_METADATA_CACHE_URLS:
+        try:
+            torrent_data, _name = fetch_torrent_url(template.format(info_hash=info_hash.upper()))
+            inspected = inspect_torrent(torrent_data, f"{info_hash}.torrent")
+        except InputError:
+            continue
+        if inspected.get("info_hash") == info_hash:
+            return torrent_data
+    return None
+
+
 def inspect_source(source: dict[str, Any], logger: InspectLogger | None = None) -> dict[str, Any]:
     route = source["route"]
     if route["engine"] == "yt-dlp":
@@ -1637,16 +1799,23 @@ def inspect_source(source: dict[str, Any], logger: InspectLogger | None = None) 
                 }
                 for index, item in enumerate(files)
             ]
-            return {
+            if len(inspected_files) > MAX_TORRENT_FILES:
+                raise qbittorrent.QbittorrentError(
+                    f"种子包含超过 {MAX_TORRENT_FILES} 个文件，暂不支持读取。"
+                )
+            inspected = {
                 "kind": "torrent",
                 "title": str(task.get("name") or "BT 下载任务"),
                 "engine": "qbittorrent",
                 "source_type": route["source_type"],
+                "info_hash": torrent_hash.lower(),
                 "file_count": len(inspected_files),
                 "file_size": sum(item["size"] or 0 for item in inspected_files) or None,
-                "files": inspected_files[:100],
+                "files": inspected_files,
                 "message": "qBittorrent 已读取文件列表。默认全选；你可以只保留需要下载的媒体文件。",
             }
+            source["bt_info_hash"] = inspected["info_hash"]
+            return inspected
         finally:
             if torrent_hash:
                 try:
@@ -1656,15 +1825,45 @@ def inspect_source(source: dict[str, Any], logger: InspectLogger | None = None) 
                     pass
             shutil.rmtree(inspect_dir, ignore_errors=True)
     if route["source_type"] in {"magnet", "thunder_bt"} and route["resolved_url"].startswith("magnet:"):
+        source["torrent_data"] = cached_magnet_metadata(route["resolved_url"])
+        if source["torrent_data"] is not None:
+            if logger is not None:
+                logger.debug("已从本地缓存读取 BT 元数据，正在整理文件列表。")
+        else:
+            if logger is not None:
+                logger.debug("正在查询公共 BT 元数据缓存；只会提交该磁力链接的 Info Hash。")
+            source["torrent_data"] = fetch_public_magnet_metadata(route["resolved_url"])
+            if source["torrent_data"] is None:
+                if logger is not None:
+                    logger.debug("公共元数据缓存未命中，正在通过 DHT 查找可返回文件列表的节点。")
+                source["torrent_data"] = aria2.fetch_magnet_metadata(
+                    route["resolved_url"],
+                    get_download_settings()["aria2"]["bt_stall_timeout"],
+                    str(DATA_DIR / ".video-downloader" / "aria2-dht.dat"),
+                )
+            cache_magnet_metadata(route["resolved_url"], source["torrent_data"])
+            if logger is not None:
+                logger.debug("已收到并校验 BT 元数据，正在整理文件列表。")
+    elif route["source_type"] in {"torrent_url", "thunder_bt"} and route["resolved_url"].lower().startswith(("http://", "https://")):
         if logger is not None:
-            logger.debug("正在通过 DHT 查找可返回文件列表的节点。")
-        source["torrent_data"] = aria2.fetch_magnet_metadata(
-            route["resolved_url"],
-            get_download_settings()["aria2"]["bt_stall_timeout"],
-        )
+            logger.debug("正在读取远程 .torrent 文件。")
+        torrent_data, torrent_name = fetch_torrent_url(route["resolved_url"])
+        source["torrent_data"] = torrent_data
+        source["torrent_name"] = torrent_name
         if logger is not None:
-            logger.debug("已收到 BT 元数据，正在整理文件列表。")
-    return inspect_non_ytdlp_input(route, source.get("url") or "", source.get("torrent_data"), source.get("torrent_name"))
+            logger.debug("远程种子文件读取完成，正在整理文件列表。")
+    inspected = inspect_non_ytdlp_input(
+        route,
+        source.get("url") or "",
+        source.get("torrent_data"),
+        source.get("torrent_name"),
+    )
+    if inspected.get("kind") == "torrent":
+        info_hash = inspected.get("info_hash") or magnet_info_hash(route.get("resolved_url") or "")
+        if info_hash:
+            source["bt_info_hash"] = info_hash
+            inspected["info_hash"] = info_hash
+    return inspected
 
 
 def run_inspect(inspect_id: str, source: dict[str, Any]) -> None:
@@ -1689,7 +1888,7 @@ def run_inspect(inspect_id: str, source: dict[str, Any]) -> None:
     append_inspect_log(inspect_id, "info", f"已识别为 {engine_label} 任务。")
     append_inspect_log(inspect_id, "info", "正在读取下载内容信息。")
     try:
-        media = inspect_source(source, InspectLogger(inspect_id) if route["engine"] == "yt-dlp" else None)
+        media = inspect_source(source, InspectLogger(inspect_id))
         append_inspect_log(inspect_id, "info", "下载内容信息读取完成，正在整理任务。")
         with inspect_jobs_lock:
             inspect_jobs[inspect_id]["status"] = "completed"
@@ -2042,10 +2241,23 @@ def incomplete_residue_preview() -> dict[str, Any]:
         rows = database.execute(
             """
             SELECT * FROM downloads
-            WHERE status != 'completed'
+            WHERE status IN ('failed', 'cancelled', 'interrupted')
             ORDER BY updated_at DESC
             """
         ).fetchall()
+        active_rows = database.execute(
+            """
+            SELECT download_dir FROM downloads
+            WHERE status IN ('queued', 'running', 'processing', 'paused')
+              AND download_dir IS NOT NULL
+            """
+        ).fetchall()
+
+    protected_roots = {
+        Path(row["download_dir"]).resolve()
+        for row in active_rows
+        if row["download_dir"]
+    }
 
     residues: dict[Path, dict[str, Any]] = {}
     scanned_roots: set[Path] = set()
@@ -2078,6 +2290,8 @@ def incomplete_residue_preview() -> dict[str, Any]:
             try:
                 path.relative_to(download_root)
             except ValueError:
+                continue
+            if any(path == root or path.is_relative_to(root) for root in protected_roots):
                 continue
             if not path.exists() or path in residues:
                 continue
@@ -2529,6 +2743,235 @@ def completed_download_ids(
     ]
 
 
+def _download_bt_info_hash(row: sqlite3.Row) -> str | None:
+    try:
+        metadata = json.loads(row["engine_metadata_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        metadata = {}
+    stored_hash = metadata.get("bt_info_hash") if isinstance(metadata, dict) else None
+    if isinstance(stored_hash, str) and re.fullmatch(r"[0-9a-fA-F]{40}", stored_hash):
+        return stored_hash.lower()
+    encoded_torrent = metadata.get("torrent_base64") if isinstance(metadata, dict) else None
+    if isinstance(encoded_torrent, str):
+        try:
+            inspected = inspect_torrent(base64.b64decode(encoded_torrent, validate=True), None)
+            info_hash = inspected.get("info_hash")
+            if isinstance(info_hash, str):
+                return info_hash
+        except (ValueError, InputError):
+            pass
+    for value in (row["resolved_url"], row["source_url"]):
+        if isinstance(value, str):
+            info_hash = magnet_info_hash(value)
+            if info_hash:
+                return info_hash
+    return None
+
+
+def _download_selected_bt_indexes(row: sqlite3.Row) -> list[int] | None:
+    try:
+        metadata = json.loads(row["engine_metadata_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    indexes = metadata.get("selected_file_indexes") if isinstance(metadata, dict) else None
+    if not isinstance(indexes, list) or not all(isinstance(value, int) for value in indexes):
+        return None
+    return sorted(set(indexes))
+
+
+def _completed_bt_output_exists(row: sqlite3.Row) -> bool:
+    if row["file_path"] and Path(row["file_path"]).is_file():
+        return True
+    try:
+        outputs = json.loads(row["output_files_json"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(outputs, list) or not row["download_dir"]:
+        return False
+    download_root = Path(row["download_dir"]).resolve()
+    for output in outputs:
+        if not isinstance(output, dict) or not isinstance(output.get("relative_path"), str):
+            continue
+        candidate = (download_root / output["relative_path"]).resolve()
+        try:
+            candidate.relative_to(download_root)
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return True
+    return False
+
+
+def matching_bt_download_ids(
+    info_hash: str | None,
+    selected_file_indexes: list[int] | None,
+    statuses: tuple[str, ...],
+    *,
+    require_completed_output: bool = False,
+) -> list[str]:
+    if not info_hash or not statuses:
+        return []
+    placeholders = ", ".join("?" for _ in statuses)
+    with connection() as database:
+        rows = database.execute(
+            f"""
+            SELECT id, source_url, resolved_url, file_path, output_files_json, download_dir, engine_metadata_json
+            FROM downloads
+            WHERE source_type IN ('magnet', 'torrent_url', 'torrent_file', 'thunder_bt')
+              AND status IN ({placeholders})
+            """,
+            statuses,
+        ).fetchall()
+    expected_indexes = sorted(set(selected_file_indexes)) if selected_file_indexes is not None else None
+    return [
+        row["id"]
+        for row in rows
+        if _download_bt_info_hash(row) == info_hash.lower()
+        and _download_selected_bt_indexes(row) == expected_indexes
+        and (not require_completed_output or _completed_bt_output_exists(row))
+    ]
+
+
+def source_follow_record(follow_id: str) -> dict[str, Any]:
+    with connection() as database:
+        row = database.execute(
+            "SELECT * FROM source_follows WHERE id = ?", (follow_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="找不到这个关注源。")
+    record = dict(row)
+    try:
+        entries = json.loads(record.pop("entries_json") or "[]")
+    except json.JSONDecodeError:
+        entries = []
+    record["entries"] = entries if isinstance(entries, list) else []
+    record["new_count"] = len(record["entries"])
+    record["check_on_startup"] = bool(record["check_on_startup"])
+    return record
+
+
+def list_source_follows() -> list[dict[str, Any]]:
+    with connection() as database:
+        ids = [
+            row["id"]
+            for row in database.execute(
+                "SELECT id FROM source_follows ORDER BY created_at DESC"
+            ).fetchall()
+        ]
+    return [source_follow_record(follow_id) for follow_id in ids]
+
+
+def source_follow_new_entries(
+    entries: list[dict[str, Any]], source_platform: str
+) -> list[dict[str, Any]]:
+    new_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        webpage_url = entry.get("webpage_url")
+        if not isinstance(webpage_url, str):
+            continue
+        if completed_download_ids(webpage_url, webpage_url=webpage_url, source_platform=source_platform):
+            continue
+        if active_download_ids(webpage_url):
+            continue
+        new_entries.append(entry)
+    return new_entries
+
+
+def inspect_follow_source(url: str) -> dict[str, Any]:
+    validate_url(url)
+    try:
+        media = inspect_url(url)
+    except DownloadError as error:
+        raise HTTPException(status_code=422, detail=friendly_inspect_error(error)) from error
+    except InputError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if media.get("kind") != "playlist":
+        raise HTTPException(status_code=422, detail="关注源必须是频道、合集或播放列表地址。")
+    return media
+
+
+def create_source_follow(request: SourceFollowRequest) -> dict[str, Any]:
+    source_url = request.url.strip()
+    with connection() as database:
+        existing = database.execute(
+            "SELECT id FROM source_follows WHERE source_url = ?", (source_url,)
+        ).fetchone()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="这个频道或合集已经关注。")
+    media = inspect_follow_source(source_url)
+    entries = source_follow_new_entries(
+        list(media.get("entries") or []),
+        str(media.get("source_platform") or platform_name(source_url)),
+    )
+    timestamp = now()
+    follow_id = str(uuid.uuid4())
+    with connection() as database:
+        database.execute(
+            """
+            INSERT INTO source_follows (
+                id, source_url, source_platform, title, uploader, thumbnail,
+                external_id, check_on_startup, last_checked_at, last_error,
+                entries_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            """,
+            (
+                follow_id,
+                source_url,
+                media.get("source_platform") or platform_name(source_url),
+                media.get("title") or "未命名关注源",
+                media.get("uploader"),
+                media.get("thumbnail"),
+                media.get("external_id"),
+                int(request.check_on_startup),
+                timestamp,
+                json.dumps(entries, ensure_ascii=False),
+                timestamp,
+                timestamp,
+            ),
+        )
+    return source_follow_record(follow_id)
+
+
+def check_source_follow(follow_id: str) -> dict[str, Any]:
+    follow = source_follow_record(follow_id)
+    try:
+        media = inspect_follow_source(follow["source_url"])
+    except HTTPException as error:
+        with connection() as database:
+            database.execute(
+                "UPDATE source_follows SET last_error = ?, last_checked_at = ?, updated_at = ? WHERE id = ?",
+                (str(error.detail), now(), now(), follow_id),
+            )
+        raise HTTPException(status_code=502, detail=f"更新检查失败：{error.detail}") from error
+    entries = source_follow_new_entries(
+        list(media.get("entries") or []),
+        str(media.get("source_platform") or follow["source_platform"]),
+    )
+    timestamp = now()
+    with connection() as database:
+        database.execute(
+            """
+            UPDATE source_follows
+            SET source_platform = ?, title = ?, uploader = ?, thumbnail = ?,
+                external_id = ?, last_checked_at = ?, last_error = NULL,
+                entries_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                media.get("source_platform") or follow["source_platform"],
+                media.get("title") or follow["title"],
+                media.get("uploader"),
+                media.get("thumbnail"),
+                media.get("external_id"),
+                timestamp,
+                json.dumps(entries, ensure_ascii=False),
+                timestamp,
+                follow_id,
+            ),
+        )
+    return source_follow_record(follow_id)
+
+
 def register_engine_process(download_id: str, process: subprocess.Popen[bytes] | None) -> None:
     with engine_processes_lock:
         if process is None:
@@ -2811,6 +3254,16 @@ def run_download(
         if final_path is None:
             raise DownloadError("下载处理已结束，但未找到最终媒体文件。请检查 FFmpeg 配置或保存位置后重试。")
         final_size = final_path.stat().st_size
+        try:
+            existing_metadata = json.loads(values.get("metadata_json") or "{}")
+        except json.JSONDecodeError:
+            existing_metadata = {}
+        try:
+            values.update(local_media_metadata_values(final_path, existing_metadata))
+        except (HTTPException, OSError):
+            # A completed download remains usable when ffprobe is unavailable;
+            # source metadata and the file extension still provide a fallback.
+            pass
         values.update(
             {
                 "file_path": str(final_path),
@@ -2827,7 +3280,7 @@ def run_download(
             }
         )
         update_download(download_id, **values)
-        append_log(download_id, "info", "下载完成，视频已加入本地视频库。")
+        append_log(download_id, "info", "下载完成，媒体已加入本地媒体库。")
     except DownloadError as error:
         if download_is_paused(download_id):
             update_download(download_id, status="paused", error=None, speed=None, eta=None, restart_pending=0)
@@ -3092,6 +3545,11 @@ def health() -> dict[str, Any]:
         "engine_version": yt_dlp.version.__version__,
         "ffmpeg_available": ffmpeg_version() is not None,
         "ffmpeg_version": ffmpeg_version(),
+        "application": {
+            "version": app.version,
+            "fastapi_version": package_version("fastapi"),
+            "uvicorn_version": package_version("uvicorn"),
+        },
         "engines": {
             "yt-dlp": {"available": True, "version": yt_dlp.version.__version__},
             "aria2": {"available": aria2.executable() is not None, "version": aria2.version()},
@@ -3121,7 +3579,85 @@ async def search_resources(request: ResourceSearchRequest) -> dict[str, Any]:
     return await asyncio.to_thread(resource_search, request)
 
 
-@app.post("/api/v1/downloads/inspect/start", status_code=202)
+@app.get("/api/v1/follows")
+def get_source_follows() -> list[dict[str, Any]]:
+    return list_source_follows()
+
+
+@app.post("/api/v1/follows", status_code=201)
+async def add_source_follow(request: SourceFollowRequest) -> dict[str, Any]:
+    return await asyncio.to_thread(create_source_follow, request)
+
+
+@app.put("/api/v1/follows/{follow_id}")
+def update_source_follow(
+    follow_id: str, request: SourceFollowUpdateRequest
+) -> dict[str, Any]:
+    source_follow_record(follow_id)
+    with connection() as database:
+        database.execute(
+            "UPDATE source_follows SET check_on_startup = ?, updated_at = ? WHERE id = ?",
+            (int(request.check_on_startup), now(), follow_id),
+        )
+    return source_follow_record(follow_id)
+
+
+@app.post("/api/v1/follows/{follow_id}/check")
+async def refresh_source_follow(follow_id: str) -> dict[str, Any]:
+    return await asyncio.to_thread(check_source_follow, follow_id)
+
+
+@app.post("/api/v1/follows/{follow_id}/downloads", status_code=201)
+def download_source_follow_entries(
+    follow_id: str,
+    request: SourceFollowDownloadRequest,
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    follow = source_follow_record(follow_id)
+    available_urls = {
+        entry.get("webpage_url")
+        for entry in follow["entries"]
+        if isinstance(entry, dict) and isinstance(entry.get("webpage_url"), str)
+    }
+    selected_urls = list(dict.fromkeys(request.entry_urls))
+    if not set(selected_urls).issubset(available_urls):
+        raise HTTPException(status_code=422, detail="选择的新视频已变化，请重新检查关注源。")
+    result = create_download_batch(
+        BatchDownloadRequest(
+            items=[
+                DownloadRequest(
+                    url=url,
+                    format_id=request.format_id,
+                    priority=request.priority,
+                )
+                for url in selected_urls
+            ]
+        ),
+        background_tasks,
+    )
+    created_urls = {
+        item["url"] for item in result["successes"] if isinstance(item.get("url"), str)
+    }
+    remaining = [
+        entry for entry in follow["entries"]
+        if entry.get("webpage_url") not in created_urls
+    ]
+    with connection() as database:
+        database.execute(
+            "UPDATE source_follows SET entries_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(remaining, ensure_ascii=False), now(), follow_id),
+        )
+    return {**result, "follow": source_follow_record(follow_id)}
+
+
+@app.delete("/api/v1/follows/{follow_id}")
+def delete_source_follow(follow_id: str) -> dict[str, str]:
+    source_follow_record(follow_id)
+    with connection() as database:
+        database.execute("DELETE FROM source_follows WHERE id = ?", (follow_id,))
+    return {"id": follow_id}
+
+
 async def start_inspect(request: InspectRequest) -> dict[str, Any]:
     source = prepare_inspect_source(request)
     inspect_id = str(uuid.uuid4())
@@ -3150,7 +3686,6 @@ def get_saved_download_settings() -> dict[str, Any]:
     return get_download_settings()
 
 
-@app.get("/api/v1/backup/export")
 def export_backup() -> StreamingResponse:
     payload = export_backup_payload()
     content = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -3227,7 +3762,6 @@ def update_general_settings(request: GeneralSettingsRequest) -> dict[str, Any]:
     return save_general_settings(request)
 
 
-@app.put("/api/v1/settings/yt-dlp")
 def update_ytdlp_settings(request: YtDlpSettingsRequest) -> dict[str, Any]:
     return save_ytdlp_settings(request)
 
@@ -3355,8 +3889,19 @@ def create_download(request: DownloadRequest, background_tasks: BackgroundTasks)
         except (InputError, aria2.Aria2Error, qbittorrent.QbittorrentError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
     route = source["route"]
+    upgrade_target: dict[str, Any] | None = None
+    if request.upgrade_from_id:
+        upgrade_target = download_record(request.upgrade_from_id)
+        if (
+            upgrade_target.get("status") != "completed"
+            or upgrade_target.get("file_origin") != "downloaded"
+            or not upgrade_target.get("file_exists")
+            or route.get("engine") != "yt-dlp"
+        ):
+            raise HTTPException(status_code=409, detail="只能升级仍有本地文件的已完成在线视频。")
     selected_file_indexes = sorted(set(request.selected_file_indexes or [])) if request.selected_file_indexes is not None else None
     is_bt = route["source_type"] in {"magnet", "torrent_url", "torrent_file", "thunder_bt"}
+    bt_info_hash: str | None = None
     if is_bt:
         if not isinstance(media, dict) or media.get("kind") != "torrent":
             raise HTTPException(status_code=422, detail="BT 文件列表尚未解析完成，请重新解析后再试。")
@@ -3377,6 +3922,11 @@ def create_download(request: DownloadRequest, background_tasks: BackgroundTasks)
             raise HTTPException(status_code=422, detail="请至少选择一个视频或音频文件再开始下载。")
         if not set(selected_file_indexes).issubset(media_indexes):
             raise HTTPException(status_code=422, detail="只能选择视频或音频文件，其他文件类型不允许下载。")
+        candidate_info_hash = source.get("bt_info_hash") or media.get("info_hash")
+        if isinstance(candidate_info_hash, str) and re.fullmatch(r"[0-9a-fA-F]{40}", candidate_info_hash):
+            bt_info_hash = candidate_info_hash.lower()
+        if bt_info_hash is None:
+            bt_info_hash = magnet_info_hash(route.get("resolved_url") or "")
     elif selected_file_indexes is not None:
         raise HTTPException(status_code=422, detail="只有已解析出文件列表的 BT 任务可以选择文件。")
     expected_size = (media or {}).get("file_size") if isinstance((media or {}).get("file_size"), int) else None
@@ -3387,6 +3937,19 @@ def create_download(request: DownloadRequest, background_tasks: BackgroundTasks)
             if isinstance(item, dict) and item.get("index") in selected_file_indexes and isinstance(item.get("size"), int)
         ) or None
     source_url = source.get("url") or f"torrent-file:{source.get('torrent_name') or 'upload'}"
+    if upgrade_target is not None:
+        target_urls = {
+            str(value)
+            for value in (upgrade_target.get("source_url"), upgrade_target.get("webpage_url"), upgrade_target.get("resolved_url"))
+            if value
+        }
+        requested_urls = {
+            str(value)
+            for value in (source_url, route.get("resolved_url"))
+            if value
+        }
+        if not target_urls.intersection(requested_urls):
+            raise HTTPException(status_code=409, detail="升级来源与原视频不一致，已停止创建任务。")
     settings = get_download_settings()
     aria2_task_settings = {
         **settings["aria2"],
@@ -3397,6 +3960,9 @@ def create_download(request: DownloadRequest, background_tasks: BackgroundTasks)
         "download_rate_limit_kbps": settings["download_rate_limit_kbps"],
     }
     base_download_dir = str(resolve_download_dir(request.download_dir)) if request.download_dir else settings["download_dir"]
+    aria2_task_settings["dht_state_path"] = str(
+        Path(base_download_dir) / ".video-downloader" / "aria2-dht.dat"
+    )
     write_thumbnail = settings["write_thumbnail"] if request.write_thumbnail is None else request.write_thumbnail
     write_info_json = settings["write_info_json"] if request.write_info_json is None else request.write_info_json
     download_id = str(uuid.uuid4())
@@ -3434,9 +4000,28 @@ def create_download(request: DownloadRequest, background_tasks: BackgroundTasks)
             (media or {}).get("video_id"),
             source_platform,
         )
-        if completed_ids:
+        if is_bt:
+            completed_ids = list(dict.fromkeys([
+                *completed_ids,
+                *matching_bt_download_ids(
+                    bt_info_hash,
+                    selected_file_indexes,
+                    ("completed",),
+                    require_completed_output=True,
+                ),
+            ]))
+        if completed_ids and upgrade_target is None:
             raise HTTPException(status_code=409, detail="这个视频已下载，可在视频管理中查看。")
         existing_ids = active_download_ids(source_url)
+        if is_bt:
+            existing_ids = list(dict.fromkeys([
+                *existing_ids,
+                *matching_bt_download_ids(
+                    bt_info_hash,
+                    selected_file_indexes,
+                    ("queued", "running", "processing", "paused"),
+                ),
+            ]))
         if existing_ids and not request.replace_existing:
             raise HTTPException(status_code=409, detail="这个链接正在下载中。")
         for existing_id in existing_ids:
@@ -3461,13 +4046,13 @@ def create_download(request: DownloadRequest, background_tasks: BackgroundTasks)
                     """
                     INSERT INTO downloads (
                         id, engine, engine_version, source_url, source_platform, source_type, resolved_url, requested_format, status,
-                        download_dir, write_thumbnail, write_info_json, yt_dlp_config, ffmpeg_config, priority, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        download_dir, write_thumbnail, write_info_json, yt_dlp_config, ffmpeg_config, priority, upgrade_from_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         download_id, "yt-dlp", yt_dlp.version.__version__, source_url, source_platform, "webpage",
                         route["resolved_url"], request.format_id, "queued", download_dir, write_thumbnail, write_info_json,
-                        yt_dlp_config, ffmpeg_config, request.priority, timestamp, timestamp,
+                        yt_dlp_config, ffmpeg_config, request.priority, request.upgrade_from_id, timestamp, timestamp,
                     ),
                 )
         elif route["engine"] == "aria2":
@@ -3480,6 +4065,8 @@ def create_download(request: DownloadRequest, background_tasks: BackgroundTasks)
                 engine_metadata["torrent_base64"] = base64.b64encode(source["torrent_data"]).decode()
             if selected_file_indexes is not None:
                 engine_metadata["selected_file_indexes"] = selected_file_indexes
+            if bt_info_hash:
+                engine_metadata["bt_info_hash"] = bt_info_hash
             engine_metadata["aria2_settings"] = aria2_task_settings
             insert_engine_download(
                 download_id, "aria2", aria2.version() or "未知版本", source_url,
@@ -3502,6 +4089,8 @@ def create_download(request: DownloadRequest, background_tasks: BackgroundTasks)
                 engine_metadata["torrent_base64"] = base64.b64encode(source["torrent_data"]).decode()
             if selected_file_indexes is not None:
                 engine_metadata["selected_file_indexes"] = selected_file_indexes
+            if bt_info_hash:
+                engine_metadata["bt_info_hash"] = bt_info_hash
             insert_engine_download(
                 download_id,
                 "qbittorrent",
@@ -3836,11 +4425,19 @@ def existing_download_task(record: dict[str, Any]) -> tuple[Any, tuple[Any, ...]
                     0,
                     int(saved_aria2_settings.get("download_rate_limit_kbps", 0)),
                 )
+                saved_dht_state_path = saved_aria2_settings.get("dht_state_path")
+                if isinstance(saved_dht_state_path, str) and saved_dht_state_path:
+                    aria2_settings["dht_state_path"] = saved_dht_state_path
+            aria2_settings.setdefault(
+                "dht_state_path",
+                str(DATA_DIR / ".video-downloader" / "aria2-dht.dat"),
+            )
         except Exception:
             current_settings = get_download_settings()
             aria2_settings = {
                 **current_settings["aria2"],
                 "download_rate_limit_kbps": current_settings["download_rate_limit_kbps"],
+                "dht_state_path": str(DATA_DIR / ".video-downloader" / "aria2-dht.dat"),
             }
         return run_aria2_task, (
             download_id,
@@ -4264,6 +4861,8 @@ def probe_local_media_file(file_path: Path) -> dict[str, Any]:
         (stream for stream in streams if stream.get("codec_type") == "audio"),
         None,
     )
+    audio_streams = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    subtitle_streams = [stream for stream in streams if stream.get("codec_type") == "subtitle"]
     if video_stream is None and audio_stream is None:
         raise HTTPException(status_code=422, detail="文件中没有可识别的视频或音频流。")
 
@@ -4296,9 +4895,272 @@ def probe_local_media_file(file_path: Path) -> dict[str, Any]:
         "duration": duration,
         "resolution": resolution,
         "codec": (selected_stream or {}).get("codec_name"),
+        "video_codec": (video_stream or {}).get("codec_name"),
+        "audio_codec": (audio_stream or {}).get("codec_name"),
+        "audio_track_count": len(audio_streams),
+        "subtitle_track_count": len(subtitle_streams),
         "bit_rate": int(bit_rate) if bit_rate is not None else None,
         "format_name": format_info.get("format_name"),
     }
+
+
+def local_media_metadata_values(
+    file_path: Path, existing_metadata: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    media_info = probe_local_media_file(file_path)
+    metadata = dict(existing_metadata or {})
+    metadata.update(
+        {
+            "media_type": media_info["media_type"],
+            "codec": media_info.get("codec"),
+            "bit_rate": media_info.get("bit_rate"),
+            "format_name": media_info.get("format_name"),
+        }
+    )
+    values: dict[str, Any] = {
+        "metadata_json": json.dumps(metadata, ensure_ascii=False),
+    }
+    if media_info.get("duration") is not None:
+        values["duration"] = media_info["duration"]
+    if media_info["media_type"] == "audio":
+        values["resolution"] = None
+    elif media_info.get("resolution") is not None:
+        values["resolution"] = media_info["resolution"]
+    return values
+
+
+@cache
+def external_player_availability() -> dict[str, bool]:
+    players = {"system": sys.platform == "darwin", "iina": False, "vlc": False}
+    if sys.platform != "darwin":
+        return players
+    for key, application in (("iina", "IINA"), ("vlc", "VLC")):
+        try:
+            result = subprocess.run(
+                ["open", "-Ra", application],
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        players[key] = result.returncode == 0
+    return players
+
+
+def video_compatibility(download_id: str) -> dict[str, Any]:
+    video = library_video(download_id)
+    media_path, _download_dir = local_video_path(video)
+    media_info = probe_local_media_file(media_path)
+    video_codec = str(media_info.get("video_codec") or "").lower()
+    audio_codec = str(media_info.get("audio_codec") or "").lower()
+    suffix = media_path.suffix.lower()
+    compatible_video_codecs = {"h264", "avc1", "hevc", "h265"}
+    compatible_audio_codecs = {"aac", "mp3", "alac", "ac3", "eac3"}
+    codec_compatible = (
+        video_codec in compatible_video_codecs
+        and (not audio_codec or audio_codec in compatible_audio_codecs)
+    )
+    container_compatible = suffix in {".mp4", ".m4v", ".mov"}
+    direct_play_likely = codec_compatible and container_compatible
+    remux_available = codec_compatible and not container_compatible
+    if direct_play_likely:
+        reason = "容器和编码通常可由内置播放器直接播放。"
+    elif remux_available:
+        reason = "视频编码兼容，但当前封装不适合内置播放器；可快速生成 MP4 兼容副本。"
+    elif video_codec:
+        reason = f"内置播放器可能不支持 {video_codec.upper()} 视频编码，建议使用外部播放器。"
+    else:
+        reason = "无法确认视频编码，建议使用外部播放器。"
+    return {
+        "download_id": download_id,
+        "file_name": media_path.name,
+        "container": media_info.get("format_name") or suffix.lstrip("."),
+        "video_codec": media_info.get("video_codec"),
+        "audio_codec": media_info.get("audio_codec"),
+        "audio_track_count": media_info.get("audio_track_count", 0),
+        "subtitle_track_count": media_info.get("subtitle_track_count", 0),
+        "direct_play_likely": direct_play_likely,
+        "remux_available": remux_available,
+        "reason": reason,
+        "players": external_player_availability(),
+    }
+
+
+def open_video_in_external_player(
+    download_id: str, request: ExternalPlayerRequest
+) -> dict[str, Any]:
+    video = library_video(download_id)
+    media_path, _download_dir = local_video_path(video)
+    if sys.platform != "darwin":
+        raise HTTPException(status_code=409, detail="当前只支持在 macOS 中打开外部播放器。")
+    commands = {
+        "system": ["open", str(media_path)],
+        "iina": ["open", "-a", "IINA", str(media_path)],
+        "vlc": ["open", "-a", "VLC", str(media_path)],
+    }
+    if request.player != "system" and not external_player_availability().get(request.player):
+        label = "IINA" if request.player == "iina" else "VLC"
+        raise HTTPException(status_code=409, detail=f"本机未检测到 {label}。")
+    try:
+        process = subprocess.Popen(
+            commands[request.player],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        raise HTTPException(status_code=500, detail="无法打开外部播放器。") from error
+    return {"download_id": download_id, "player": request.player, "pid": process.pid}
+
+
+def media_derivative_job_record(job_id: str) -> dict[str, Any]:
+    with connection() as database:
+        row = database.execute(
+            "SELECT * FROM media_derivative_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="找不到这条兼容处理任务。")
+    return dict(row)
+
+
+def update_media_derivative_job(job_id: str, **values: Any) -> None:
+    if not values:
+        return
+    values["updated_at"] = now()
+    assignments = ", ".join(f"{column} = ?" for column in values)
+    with connection() as database:
+        database.execute(
+            f"UPDATE media_derivative_jobs SET {assignments} WHERE id = ?",
+            [*values.values(), job_id],
+        )
+    events.publish({"type": "media-derivative", "job": media_derivative_job_record(job_id)})
+
+
+def compatibility_output_path(video: dict[str, Any]) -> Path:
+    settings = get_download_settings()
+    output_dir = Path(settings["download_dir"]) / "兼容版本"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    title = safe_media_title(video.get("title") or "未命名视频")
+    candidate = output_dir / f"{title}（兼容版）.mp4"
+    index = 2
+    while candidate.exists():
+        candidate = output_dir / f"{title}（兼容版 {index}）.mp4"
+        index += 1
+    return candidate
+
+
+def run_compatibility_remux(job_id: str, download_id: str) -> None:
+    video = library_video(download_id)
+    media_path, _download_dir = local_video_path(video)
+    compatibility = video_compatibility(download_id)
+    if not compatibility["remux_available"]:
+        update_media_derivative_job(job_id, status="failed", error="当前文件不适合仅换封装处理。")
+        return
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        update_media_derivative_job(job_id, status="failed", error="未找到 FFmpeg，无法生成兼容副本。")
+        return
+    output_path = compatibility_output_path(video)
+    temporary_path = output_path.with_suffix(".part.mp4")
+    try:
+        ensure_disk_capacity(
+            str(output_path.parent),
+            media_path.stat().st_size,
+            minimum_free_space_mb=get_download_settings()["minimum_free_space_mb"],
+        )
+        update_media_derivative_job(job_id, status="running", file_path=str(output_path), error=None)
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(media_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(temporary_path),
+        ]
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        with media_job_processes_lock:
+            media_job_processes[job_id] = process
+        _stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            message = normalize_message((stderr or b"").decode(errors="replace"))[-1200:]
+            raise RuntimeError(message or "FFmpeg 兼容封装失败。")
+        temporary_path.replace(output_path)
+        media_info = probe_local_media_file(output_path)
+        if media_info.get("media_type") != "video":
+            raise RuntimeError("生成的兼容副本中没有可播放视频。")
+        registered = register_local_video(
+            LocalVideoRequest(
+                file_path=str(output_path),
+                title=f"{video.get('title') or '未命名视频'}（兼容版）",
+            )
+        )
+        update_media_derivative_job(
+            job_id,
+            status="completed",
+            file_path=str(output_path),
+            file_size=output_path.stat().st_size,
+            library_video_id=registered["id"],
+            error=None,
+        )
+    except Exception as error:
+        temporary_path.unlink(missing_ok=True)
+        output_path.unlink(missing_ok=True)
+        update_media_derivative_job(
+            job_id,
+            status="failed",
+            error=normalize_message(str(error)) or "兼容副本生成失败。",
+        )
+    finally:
+        with media_job_processes_lock:
+            media_job_processes.pop(job_id, None)
+
+
+def create_compatibility_remux(download_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    compatibility = video_compatibility(download_id)
+    if not compatibility["remux_available"]:
+        raise HTTPException(status_code=409, detail="当前文件不能只通过换封装生成兼容副本。")
+    with connection() as database:
+        active = database.execute(
+            """
+            SELECT id FROM media_derivative_jobs
+            WHERE download_id = ? AND kind = 'compatibility_remux'
+              AND status IN ('queued', 'running')
+            """,
+            (download_id,),
+        ).fetchone()
+        if active is not None:
+            raise HTTPException(status_code=409, detail="这个视频正在生成兼容副本。")
+        completed = database.execute(
+            """
+            SELECT file_path FROM media_derivative_jobs
+            WHERE download_id = ? AND kind = 'compatibility_remux'
+              AND status = 'completed' AND file_path IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (download_id,),
+        ).fetchone()
+        if completed is not None and Path(completed["file_path"]).is_file():
+            raise HTTPException(status_code=409, detail="这个视频已经生成了兼容副本。")
+        job_id = str(uuid.uuid4())
+        timestamp = now()
+        database.execute(
+            """
+            INSERT INTO media_derivative_jobs (
+                id, download_id, kind, status, created_at, updated_at
+            ) VALUES (?, ?, 'compatibility_remux', 'queued', ?, ?)
+            """,
+            (job_id, download_id, timestamp, timestamp),
+        )
+    background_tasks.add_task(run_compatibility_remux, job_id, download_id)
+    return media_derivative_job_record(job_id)
 
 
 def register_download_media_outputs(download_id: str) -> list[dict[str, Any]]:
@@ -4307,8 +5169,28 @@ def register_download_media_outputs(download_id: str) -> list[dict[str, Any]]:
         output for output in download_output_files(download_id)
         if output["playable"]
     ]
-    if len(playable_outputs) <= 1:
+    if not playable_outputs:
         return []
+    if len(playable_outputs) == 1:
+        output = playable_outputs[0]
+        _, file_path = resolve_download_output(download_id, output["index"], playable_only=True)
+        try:
+            values = local_media_metadata_values(
+                file_path,
+                parent.get("metadata") if isinstance(parent.get("metadata"), dict) else {},
+            )
+        except (HTTPException, OSError):
+            return []
+        values.update(
+            {
+                "file_path": str(file_path),
+                "file_size": file_path.stat().st_size,
+                "library_visible": 1,
+            }
+        )
+        update_download(download_id, **values)
+        publish_download(download_id)
+        return [download_record(download_id, include_metadata=True)]
 
     indexed_outputs: list[dict[str, Any]] = []
     for output in playable_outputs:
@@ -4429,11 +5311,65 @@ def register_download_media_outputs(download_id: str) -> list[dict[str, Any]]:
     return videos
 
 
+def local_video_thumbnail_path(download_id: str) -> Path:
+    if not re.fullmatch(r"[a-zA-Z0-9-]{1,100}", download_id):
+        raise HTTPException(status_code=404, detail="本地封面不存在。")
+    return (DATA_DIR / ".video-downloader" / "thumbnails" / f"{download_id}.jpg").resolve()
+
+
+def generate_local_video_thumbnail(
+    download_id: str, file_path: Path, duration: float | None
+) -> str | None:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        return None
+    output_path = local_video_thumbnail_path(download_id)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(f"{output_path.stem}.tmp.jpg")
+    position = min(60.0, max(1.0, float(duration or 10) * 0.1))
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{position:.3f}",
+                "-i",
+                str(file_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale='min(640,iw)':-2",
+                "-y",
+                str(temporary_path),
+            ],
+            capture_output=True,
+            timeout=45,
+            check=False,
+        )
+        if result.returncode != 0 or not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+            temporary_path.unlink(missing_ok=True)
+            return None
+        temporary_path.replace(output_path)
+    except (OSError, subprocess.SubprocessError):
+        temporary_path.unlink(missing_ok=True)
+        return None
+    thumbnail = f"/api/v1/videos/{download_id}/thumbnail"
+    with connection() as database:
+        database.execute(
+            "UPDATE downloads SET thumbnail = ?, updated_at = ? WHERE id = ? AND file_origin = 'local'",
+            (thumbnail, now(), download_id),
+        )
+    return thumbnail
+
+
 def refresh_local_media_metadata() -> None:
     with connection() as database:
         rows = database.execute(
             """
-            SELECT id, file_path, metadata_json
+            SELECT id, file_path, metadata_json, thumbnail, duration
             FROM downloads
             WHERE status = 'completed'
               AND library_visible = 1
@@ -4446,43 +5382,42 @@ def refresh_local_media_metadata() -> None:
             metadata = json.loads(row["metadata_json"] or "{}")
         except json.JSONDecodeError:
             metadata = {}
-        if metadata.get("media_type") in {"video", "audio"}:
-            continue
         file_path = Path(row["file_path"] or "")
         if not file_path.is_file():
             continue
-        try:
-            media_info = probe_local_media_file(file_path)
-            file_size = file_path.stat().st_size
-        except (HTTPException, OSError):
-            continue
-        metadata.update(
-            {
-                "media_type": media_info["media_type"],
-                "codec": media_info["codec"],
-                "bit_rate": media_info["bit_rate"],
-                "format_name": media_info["format_name"],
-            }
-        )
-        with connection() as database:
-            database.execute(
-                """
-                UPDATE downloads
-                SET duration = ?, resolution = ?, file_size = ?,
-                    downloaded_bytes = ?, total_bytes = ?, metadata_json = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    media_info["duration"],
-                    media_info["resolution"],
-                    file_size,
-                    file_size,
-                    file_size,
-                    json.dumps(metadata, ensure_ascii=False),
-                    now(),
-                    row["id"],
-                ),
+        if metadata.get("media_type") not in {"video", "audio"}:
+            try:
+                media_info = probe_local_media_file(file_path)
+                file_size = file_path.stat().st_size
+            except (HTTPException, OSError):
+                continue
+            metadata.update(
+                {
+                    "media_type": media_info["media_type"],
+                    "codec": media_info["codec"],
+                    "bit_rate": media_info["bit_rate"],
+                    "format_name": media_info["format_name"],
+                }
             )
+            with connection() as database:
+                database.execute(
+                    """
+                    UPDATE downloads
+                    SET duration = ?, resolution = ?, file_size = ?,
+                        downloaded_bytes = ?, total_bytes = ?, metadata_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        media_info["duration"], media_info["resolution"], file_size,
+                        file_size, file_size, json.dumps(metadata, ensure_ascii=False), now(), row["id"],
+                    ),
+                )
+        cached_thumbnail_missing = (
+            row["thumbnail"] == f"/api/v1/videos/{row['id']}/thumbnail"
+            and not local_video_thumbnail_path(row["id"]).is_file()
+        )
+        if metadata.get("media_type") == "video" and (not row["thumbnail"] or cached_thumbnail_missing):
+            generate_local_video_thumbnail(row["id"], file_path, row["duration"])
 
 
 def register_local_video(
@@ -4560,6 +5495,9 @@ def register_local_video(
                 timestamp,
             ),
         )
+
+    if media_info["media_type"] == "video":
+        generate_local_video_thumbnail(video_id, file_path, media_info["duration"])
 
     video = download_record(video_id, include_metadata=True)
     if publish_event:
@@ -4792,6 +5730,34 @@ def scan_library_directories() -> dict[str, Any]:
     if last_added_video is not None:
         events.publish({"type": "download", "download": last_added_video})
     return result
+
+
+def refresh_local_library_on_startup() -> None:
+    refresh_local_media_metadata()
+    settings = get_download_settings()
+    report: dict[str, Any] = {
+        "started_at": now(),
+        "finished_at": None,
+        "status": "skipped",
+        "reason": "startup_scan_disabled" if not settings["scan_library_on_startup"] else "no_library_dirs",
+    }
+    if settings["scan_library_on_startup"] and settings["library_dirs"]:
+        try:
+            report = {**scan_library_directories(), "started_at": report["started_at"], "status": "completed"}
+        except Exception as error:
+            report = {**report, "status": "failed", "error": normalize_message(str(error))}
+    report["finished_at"] = now()
+    save_settings_values({"last_library_scan": report})
+
+
+@app.get("/api/v1/videos/{download_id}/thumbnail")
+def get_local_video_thumbnail(download_id: str) -> FileResponse:
+    video = library_video(download_id)
+    expected_url = f"/api/v1/videos/{download_id}/thumbnail"
+    thumbnail_path = local_video_thumbnail_path(download_id)
+    if video.get("file_origin") != "local" or video.get("thumbnail") != expected_url or not thumbnail_path.is_file():
+        raise HTTPException(status_code=404, detail="本地封面不存在。")
+    return FileResponse(thumbnail_path, media_type="image/jpeg")
 
 
 @app.get("/api/v1/videos")
@@ -5044,6 +6010,102 @@ def list_library_items(
         "page_size": page_size,
         "total_pages": total_pages,
     }
+
+
+def continue_watching_items(limit: int = 8) -> dict[str, list[dict[str, Any]]]:
+    """Return resumable videos and the next unwatched item in engaged playlists."""
+    with connection() as database:
+        rows = database.execute(
+            """
+            SELECT id, playlist_id, playlist_index, watch_position, watched,
+                   last_watched_at, file_path, metadata_json
+            FROM downloads
+            WHERE status = 'completed' AND library_visible = 1
+            ORDER BY COALESCE(last_watched_at, '') DESC, created_at DESC
+            """
+        ).fetchall()
+
+    def playable_video(row: sqlite3.Row) -> bool:
+        file_path = row["file_path"]
+        if not file_path or not Path(file_path).is_file():
+            return False
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        media_type = metadata.get("media_type")
+        if media_type == "audio":
+            return False
+        return media_type == "video" or Path(file_path).suffix.lower() in VIDEO_EXTENSIONS
+
+    video_rows = [row for row in rows if playable_video(row)]
+    continuing = [
+        {
+            "reason": "continue",
+            "video": download_record(row["id"], include_metadata=True),
+        }
+        for row in video_rows
+        if float(row["watch_position"] or 0) > 0 and not row["watched"]
+    ][:limit]
+
+    playlist_rows: dict[str, list[sqlite3.Row]] = {}
+    for row in video_rows:
+        if row["playlist_id"]:
+            playlist_rows.setdefault(row["playlist_id"], []).append(row)
+
+    next_up: list[dict[str, Any]] = []
+    for playlist_id, children in playlist_rows.items():
+        ordered = sorted(
+            children,
+            key=lambda row: (int(row["playlist_index"] or 0), row["id"]),
+        )
+        engaged = [
+            row for row in ordered
+            if row["watched"] or float(row["watch_position"] or 0) > 0
+        ]
+        if not engaged:
+            continue
+        latest = max(
+            engaged,
+            key=lambda row: (int(row["playlist_index"] or 0), row["last_watched_at"] or ""),
+        )
+        # An unfinished item belongs in "continue watching"; do not also urge
+        # the user to skip it for the next episode.
+        if not latest["watched"]:
+            continue
+        candidate = next(
+            (
+                row for row in ordered
+                if int(row["playlist_index"] or 0) > int(latest["playlist_index"] or 0)
+                and not row["watched"]
+                and float(row["watch_position"] or 0) == 0
+            ),
+            None,
+        )
+        if candidate is None:
+            continue
+        with connection() as database:
+            playlist = database.execute(
+                "SELECT title FROM playlists WHERE id = ?", (playlist_id,)
+            ).fetchone()
+        next_up.append(
+            {
+                "reason": "next",
+                "playlist_title": playlist["title"] if playlist else None,
+                "video": download_record(candidate["id"], include_metadata=True),
+                "last_watched_at": latest["last_watched_at"],
+            }
+        )
+
+    next_up.sort(key=lambda item: item.get("last_watched_at") or "", reverse=True)
+    for item in next_up:
+        item.pop("last_watched_at", None)
+    return {"continuing": continuing, "next_up": next_up[:limit]}
+
+
+@app.get("/api/v1/library/continue-watching")
+def get_continue_watching(limit: int = Query(default=8, ge=1, le=24)) -> dict[str, Any]:
+    return continue_watching_items(limit)
 
 
 @app.get("/api/v1/videos/suggestions")
@@ -5328,6 +6390,187 @@ def update_video_favorite(
     return download_record(download_id, include_metadata=True)
 
 
+@app.get("/api/v1/videos/{download_id}/compatibility")
+def get_video_compatibility(download_id: str) -> dict[str, Any]:
+    return video_compatibility(download_id)
+
+
+@app.post("/api/v1/videos/{download_id}/open")
+def open_video_external(
+    download_id: str, request: ExternalPlayerRequest
+) -> dict[str, Any]:
+    return open_video_in_external_player(download_id, request)
+
+
+@app.post("/api/v1/videos/{download_id}/compatibility/remux", status_code=202)
+def start_video_compatibility_remux(
+    download_id: str, background_tasks: BackgroundTasks
+) -> dict[str, Any]:
+    return create_compatibility_remux(download_id, background_tasks)
+
+
+@app.get("/api/v1/videos/{download_id}/compatibility/jobs")
+def list_video_compatibility_jobs(download_id: str) -> list[dict[str, Any]]:
+    library_video(download_id)
+    with connection() as database:
+        ids = [
+            row["id"]
+            for row in database.execute(
+                """
+                SELECT id FROM media_derivative_jobs
+                WHERE download_id = ? AND kind = 'compatibility_remux'
+                ORDER BY created_at DESC
+                """,
+                (download_id,),
+            ).fetchall()
+        ]
+    return [media_derivative_job_record(job_id) for job_id in ids]
+
+
+@app.get("/api/v1/media-derivative-jobs/{job_id}")
+def get_media_derivative_job(job_id: str) -> dict[str, Any]:
+    return media_derivative_job_record(job_id)
+
+
+def resolution_height(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(?:x|^)(\d{3,5})p?$", value.strip().lower())
+    return int(match.group(1)) if match else None
+
+
+def video_upgrade_options(download_id: str) -> dict[str, Any]:
+    video = library_video(download_id)
+    if video.get("file_origin") != "downloaded" or video.get("engine") != "yt-dlp":
+        raise HTTPException(status_code=409, detail="本地导入的视频没有可检查的在线画质来源。")
+    if not video.get("file_exists"):
+        raise HTTPException(status_code=409, detail="原视频文件不存在，无法安全升级画质。")
+    with connection() as database:
+        pending_upgrades = database.execute(
+            """
+            SELECT file_path FROM downloads
+            WHERE upgrade_from_id = ? AND status = 'completed'
+              AND library_visible = 1 AND file_path IS NOT NULL
+            """,
+            (download_id,),
+        ).fetchall()
+    if any(Path(row["file_path"]).is_file() for row in pending_upgrades):
+        raise HTTPException(status_code=409, detail="已有更高画质版本等待确认，请先处理新旧版本。")
+    source_url = str(video.get("webpage_url") or video.get("source_url") or "")
+    if not source_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=409, detail="这条视频没有可重新检查的原页面地址。")
+    try:
+        media = inspect_url(source_url)
+    except DownloadError as error:
+        raise HTTPException(status_code=422, detail=friendly_inspect_error(error)) from error
+    except InputError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if media.get("kind") != "video":
+        raise HTTPException(status_code=409, detail="原页面现在不再指向单个视频。")
+
+    current_resolution = video.get("resolution")
+    current_height = resolution_height(current_resolution)
+    if current_height is None:
+        try:
+            media_path, _ = local_video_path(video)
+            current_resolution = probe_local_media_file(media_path).get("resolution")
+            current_height = resolution_height(current_resolution)
+        except HTTPException:
+            current_height = None
+    candidates = []
+    preference_order: dict[str, int] = {}
+    for preference_index, item in enumerate(media.get("formats") or []):
+        height = resolution_height(item.get("resolution"))
+        if height is None or (current_height is not None and height <= current_height):
+            continue
+        preference_order[str(item.get("format_id") or "")] = preference_index
+        candidates.append({**item, "height": height})
+    # The download dialog exposes yt-dlp's best format first. Upgrade choices
+    # are shown from lower to higher resolution, with the preferred format last
+    # at the same height so the UI's default remains the best available choice.
+    candidates.sort(
+        key=lambda item: (
+            item["height"],
+            -preference_order.get(str(item.get("format_id") or ""), 0),
+        )
+    )
+    return {
+        "download_id": download_id,
+        "source_url": source_url,
+        "current_resolution": current_resolution,
+        "current_height": current_height,
+        "candidates": candidates,
+    }
+
+
+@app.get("/api/v1/videos/{download_id}/upgrade-options")
+def get_video_upgrade_options(download_id: str) -> dict[str, Any]:
+    return video_upgrade_options(download_id)
+
+
+@app.post("/api/v1/videos/{download_id}/upgrade", status_code=201)
+def start_video_upgrade(
+    download_id: str, request: VideoUpgradeRequest, background_tasks: BackgroundTasks
+) -> dict[str, Any]:
+    options = video_upgrade_options(download_id)
+    allowed_formats = {item["format_id"] for item in options["candidates"]}
+    if request.format_id not in allowed_formats:
+        raise HTTPException(status_code=409, detail="所选画质不高于当前文件，或已不再可用。")
+    return create_download(
+        DownloadRequest(
+            url=options["source_url"],
+            format_id=request.format_id,
+            priority=request.priority,
+            upgrade_from_id=download_id,
+        ),
+        background_tasks,
+    )
+
+
+@app.post("/api/v1/videos/{download_id}/upgrade-finalize", response_model=None)
+def finalize_video_upgrade(
+    download_id: str, request: VideoUpgradeFinalizeRequest
+) -> dict[str, Any] | JSONResponse:
+    upgraded = library_video(download_id)
+    original_id = upgraded.get("upgrade_from_id")
+    if not original_id:
+        raise HTTPException(status_code=409, detail="这条视频没有待确认的旧版本。")
+    if not request.confirm:
+        raise HTTPException(status_code=409, detail="请明确确认后再处理旧版本。")
+    original = library_video(str(original_id))
+    if not upgraded.get("file_exists"):
+        raise HTTPException(status_code=409, detail="新版本文件不存在，旧版本已保留。")
+    if request.remove_original_file:
+        preserved_values = {
+            key: original.get(key)
+            for key in (
+                "title",
+                "uploader",
+                "thumbnail",
+                "upload_date",
+                "playlist_id",
+                "playlist_index",
+                "favorite",
+                "watched",
+                "watch_position",
+                "last_watched_at",
+            )
+        }
+        result = delete_video(str(original_id), remove_file=True)
+        if isinstance(result, JSONResponse):
+            return result
+        update_download(download_id, **preserved_values)
+    else:
+        result = {"id": original["id"], "kept": True, "trashed_files": []}
+    with connection() as database:
+        database.execute(
+            "UPDATE downloads SET upgrade_from_id = NULL, updated_at = ? WHERE id = ?",
+            (now(), download_id),
+        )
+    publish_download(download_id)
+    return {"video": download_record(download_id, include_metadata=True), "original": result}
+
+
 @app.put("/api/v1/videos/{download_id}/progress")
 def update_video_progress(
     download_id: str, request: PlaybackProgressRequest
@@ -5338,9 +6581,9 @@ def update_video_progress(
     if duration and duration > 0:
         position = min(position, duration)
         watched_threshold = max(duration * 0.9, duration - 30)
-        watched = position >= watched_threshold
+        watched = bool(video.get("watched")) or position >= watched_threshold
     else:
-        watched = False
+        watched = bool(video.get("watched"))
     values: dict[str, Any] = {
         "watch_position": position,
         "watched": int(watched),
@@ -5591,10 +6834,26 @@ def delete_video(
         ).fetchone()
         if active_denoise_job:
             raise HTTPException(status_code=409, detail="正在生成降噪副本，请完成后再删除此视频。")
+        active_media_job = database.execute(
+            """
+            SELECT id FROM media_derivative_jobs
+            WHERE download_id = ? AND status IN ('queued', 'running')
+            """,
+            (download_id,),
+        ).fetchone()
+        if active_media_job:
+            raise HTTPException(status_code=409, detail="正在生成兼容副本，请完成后再删除此视频。")
         denoise_rows = database.execute(
             "SELECT file_path FROM video_denoise_jobs WHERE download_id = ?",
             (download_id,),
         ).fetchall()
+
+    local_thumbnail = (
+        local_video_thumbnail_path(download_id)
+        if video.get("file_origin") == "local"
+        and video.get("thumbnail") == f"/api/v1/videos/{download_id}/thumbnail"
+        else None
+    )
 
     trashed_files: list[str] = []
     if remove_file:
@@ -5659,7 +6918,20 @@ def delete_video(
     with connection() as database:
         database.execute("DELETE FROM download_logs WHERE download_id = ?", (download_id,))
         database.execute("DELETE FROM video_denoise_jobs WHERE download_id = ?", (download_id,))
+        database.execute("DELETE FROM media_derivative_jobs WHERE download_id = ?", (download_id,))
+        database.execute(
+            """
+            UPDATE media_derivative_jobs
+            SET status = 'failed', file_path = NULL, file_size = NULL,
+                library_video_id = NULL, error = '兼容副本已从媒体库删除。', updated_at = ?
+            WHERE library_video_id = ?
+            """,
+            (now(), download_id),
+        )
+        database.execute("UPDATE downloads SET upgrade_from_id = NULL WHERE upgrade_from_id = ?", (download_id,))
         database.execute("DELETE FROM downloads WHERE id = ?", (download_id,))
+    if local_thumbnail is not None:
+        local_thumbnail.unlink(missing_ok=True)
 
     events.publish({"type": "video_deleted", "download_id": download_id})
     return {"id": download_id, "trashed_files": trashed_files, "failed_files": []}

@@ -16,6 +16,21 @@ class ResourceSearchRequest(BaseModel):
     limit: int = Field(default=20, ge=1, le=50)
 
 
+class SourceFollowRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    check_on_startup: bool = True
+
+
+class SourceFollowUpdateRequest(BaseModel):
+    check_on_startup: bool
+
+
+class SourceFollowDownloadRequest(BaseModel):
+    entry_urls: list[str] = Field(min_length=1, max_length=50)
+    format_id: str | None = Field(default=None, max_length=200)
+    priority: int = Field(default=0, ge=-1, le=1)
+
+
 class DownloadRequest(BaseModel):
     url: str | None = Field(default=None, max_length=2048)
     inspect_id: str | None = Field(default=None, min_length=1, max_length=100)
@@ -29,6 +44,7 @@ class DownloadRequest(BaseModel):
     yt_dlp_config: str | None = Field(default=None, max_length=30000)
     ffmpeg_config: str | None = Field(default=None, max_length=30000)
     priority: int = Field(default=0, ge=-1, le=1)
+    upgrade_from_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class BatchDownloadRequest(BaseModel):
@@ -51,6 +67,7 @@ class DownloadSettingsRequest(BaseModel):
     download_dir: str = Field(min_length=1, max_length=4096)
     directory_pattern: str = Field(default="{platform}/{year}-{month}/{title}", max_length=500)
     library_dirs: list[str] = Field(default_factory=list, max_length=20)
+    scan_library_on_startup: bool = True
     write_thumbnail: bool = True
     write_info_json: bool = True
     max_concurrent_downloads: int = Field(default=5, ge=1, le=10)
@@ -65,6 +82,7 @@ class GeneralSettingsRequest(BaseModel):
     download_dir: str = Field(min_length=1, max_length=4096)
     directory_pattern: str = Field(default="{platform}/{year}-{month}/{title}", max_length=500)
     library_dirs: list[str] = Field(default_factory=list, max_length=20)
+    scan_library_on_startup: bool = True
     write_thumbnail: bool = True
     write_info_json: bool = True
     max_concurrent_downloads: int = Field(default=5, ge=1, le=10)
@@ -111,6 +129,20 @@ class VideoFavoriteRequest(BaseModel):
 
 class VideoWatchedRequest(BaseModel):
     watched: bool
+
+
+class ExternalPlayerRequest(BaseModel):
+    player: str = Field(default="system", pattern=r"^(system|iina|vlc)$")
+
+
+class VideoUpgradeRequest(BaseModel):
+    format_id: str = Field(min_length=1, max_length=200)
+    priority: int = Field(default=0, ge=-1, le=1)
+
+
+class VideoUpgradeFinalizeRequest(BaseModel):
+    confirm: bool = False
+    remove_original_file: bool = False
 
 
 class EngineSettingsRequest(BaseModel):

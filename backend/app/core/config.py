@@ -13,6 +13,7 @@ DEFAULT_DOWNLOAD_SETTINGS = {
     "download_dir": str(DOWNLOAD_DIR),
     "directory_pattern": "{platform}/{year}-{month}/{title}",
     "library_dirs": [],
+    "scan_library_on_startup": True,
     "write_thumbnail": True,
     "write_info_json": True,
     "max_concurrent_downloads": 5,

@@ -303,6 +303,37 @@ class FileManagementTests(unittest.TestCase):
             {"parent-task-output-0", "parent-task-output-1"},
         )
 
+    def test_single_audio_output_gets_actual_media_metadata(self) -> None:
+        download_root = self.root / "downloads"
+        download_root.mkdir(parents=True)
+        audio = download_root / "track.mp3"
+        audio.write_bytes(b"audio")
+        self.insert_download(
+            "audio-task",
+            status="completed",
+            title="track.mp3",
+            file_path=str(audio),
+            library_visible=1,
+            output_files_json=json.dumps([
+                {"relative_path": "track.mp3", "size": 5, "file_type": "audio/mpeg", "playable": True},
+            ]),
+        )
+
+        with patch.object(server, "probe_local_media_file", return_value={
+            "media_type": "audio",
+            "duration": 30.0,
+            "resolution": None,
+            "codec": "mp3",
+            "bit_rate": 128_000,
+            "format_name": "mp3",
+        }):
+            [registered] = server.register_download_media_outputs("audio-task")
+
+        self.assertEqual(registered["metadata"]["media_type"], "audio")
+        self.assertEqual(registered["metadata"]["bit_rate"], 128_000)
+        self.assertEqual(registered["duration"], 30.0)
+        self.assertIsNone(registered["resolution"])
+
     def test_output_child_keeps_independent_favorite_and_progress(self) -> None:
         download_root = self.root / "downloads"
         task_directory = download_root / "BT" / "parent-state"

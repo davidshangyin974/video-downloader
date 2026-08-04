@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import re
 from pathlib import PurePosixPath
 from typing import Any
@@ -16,6 +17,10 @@ from ..core.config import DIRECT_FILE_EXTENSIONS, MEDIA_EXTENSIONS
 
 class InputError(ValueError):
     """A user-facing unsupported or malformed download input."""
+
+
+MAX_TORRENT_FILE_BYTES = 8 * 1024 * 1024
+MAX_TORRENT_FILES = 5000
 
 
 def decode_thunder_url(url: str) -> str:
@@ -119,6 +124,34 @@ def direct_file_probe(url: str) -> dict[str, Any]:
         return {"file_name": direct_file_name(url), "file_size": None, "content_type": None}
 
 
+def fetch_torrent_url(url: str, max_bytes: int = MAX_TORRENT_FILE_BYTES) -> tuple[bytes, str]:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Video Downloader/0.1",
+            "Accept": "application/x-bittorrent, application/octet-stream;q=0.8, */*;q=0.2",
+        },
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+                raise InputError(f"远程种子文件超过 {max_bytes // 1024 // 1024} MB，已停止读取。")
+            payload = response.read(max_bytes + 1)
+            if len(payload) > max_bytes:
+                raise InputError(f"远程种子文件超过 {max_bytes // 1024 // 1024} MB，已停止读取。")
+            final_url = response.geturl() if hasattr(response, "geturl") else url
+    except InputError:
+        raise
+    except HTTPError as error:
+        raise InputError(f"远程种子地址返回 HTTP {error.code}，请确认链接仍有效。") from error
+    except (URLError, TimeoutError, OSError, ValueError) as error:
+        raise InputError("无法读取远程种子文件，请检查链接和网络后重试。") from error
+    if not payload:
+        raise InputError("远程种子文件内容为空。")
+    return payload, direct_file_name(str(final_url))
+
+
 def _parse_bencode(data: bytes, offset: int = 0) -> tuple[Any, int]:
     if offset >= len(data):
         raise InputError("种子文件内容不完整。")
@@ -170,12 +203,47 @@ def _decode_torrent_value(value: Any) -> str:
     return ""
 
 
+def _torrent_info_payload(payload: bytes) -> bytes:
+    if not payload.startswith(b"d"):
+        raise InputError("这不是有效的 .torrent 文件。")
+    offset = 1
+    while payload[offset : offset + 1] != b"e":
+        key, offset = _parse_bencode(payload, offset)
+        if not isinstance(key, bytes):
+            raise InputError("种子文件字典键无效。")
+        value_start = offset
+        _value, offset = _parse_bencode(payload, offset)
+        if key == b"info":
+            return payload[value_start:offset]
+    raise InputError("这不是有效的 .torrent 文件。")
+
+
+def magnet_info_hash(url: str) -> str | None:
+    try:
+        values = parse_qs(urlparse(url).query).get("xt", [])
+    except ValueError:
+        return None
+    for value in values:
+        if not value.lower().startswith("urn:btih:"):
+            continue
+        candidate = value[9:].strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40}", candidate):
+            return candidate.lower()
+        if re.fullmatch(r"[A-Z2-7a-z2-7]{32}", candidate):
+            try:
+                return base64.b32decode(candidate.upper()).hex()
+            except binascii.Error:
+                continue
+    return None
+
+
 def inspect_torrent(data: bytes, original_name: str | None) -> dict[str, Any]:
     # Some hand-created or exported torrent files end with a text line break.
     # It is harmless outside the bencoded payload and should not hide the file list.
     payload = data.rstrip(b"\r\n")
     try:
         torrent, end = _parse_bencode(payload)
+        info_payload = _torrent_info_payload(payload)
     except RecursionError as error:
         raise InputError("种子文件层级过深，无法读取。") from error
     if end != len(payload) or not isinstance(torrent, dict) or not isinstance(torrent.get(b"info"), dict):
@@ -184,6 +252,8 @@ def inspect_torrent(data: bytes, original_name: str | None) -> dict[str, Any]:
     title = _decode_torrent_value(info.get(b"name")) or original_name or "未命名种子"
     files: list[dict[str, Any]] = []
     if isinstance(info.get(b"files"), list):
+        if len(info[b"files"]) > MAX_TORRENT_FILES:
+            raise InputError(f"种子包含超过 {MAX_TORRENT_FILES} 个文件，暂不支持读取。")
         for index, item in enumerate(info[b"files"]):
             if not isinstance(item, dict):
                 continue
@@ -199,9 +269,10 @@ def inspect_torrent(data: bytes, original_name: str | None) -> dict[str, Any]:
         "title": title,
         "engine": "aria2",
         "source_type": "torrent_file",
+        "info_hash": hashlib.sha1(info_payload).hexdigest(),
         "file_count": len(files),
         "file_size": sum(item["size"] or 0 for item in files) or None,
-        "files": files[:100],
+        "files": files,
     }
 
 
@@ -237,6 +308,7 @@ def inspect_non_ytdlp_input(route: dict[str, str], original_url: str, torrent_da
         "title": title,
         "engine": route["engine"],
         "source_type": route["source_type"],
+        "info_hash": magnet_info_hash(resolved_url),
         "file_count": None,
         "file_size": None,
         "files": [],
