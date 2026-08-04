@@ -1,0 +1,24 @@
+{
+  "name": "video-downloader-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "check": "tsc -b"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "plyr": "^3.8.4",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest",
+    "wavesurfer.js": "^7.12.11"
+  },
+  "devDependencies": {
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "typescript": "latest"
+  }
+}
