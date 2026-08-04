@@ -8,7 +8,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 
 from app import server
 from app.core import storage
@@ -212,6 +212,43 @@ class LibraryItemTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in filtered["items"]], ["playlist-1"])
         self.assertEqual(filtered["items"][0]["favorite"], 1)
         self.assertEqual(filtered["items"][0]["favorite_count"], 0)
+
+    def test_deleting_playlist_removes_its_videos_and_keeps_files_when_requested(self) -> None:
+        self.insert_playlist("playlist-1")
+        self.insert_download("child-1", playlist_id="playlist-1", playlist_index=1)
+
+        deleted = server.delete_playlist("playlist-1", remove_files=False)
+
+        self.assertEqual(
+            deleted,
+            {"id": "playlist-1", "deleted_video_count": 1, "trashed_files": []},
+        )
+        with self.assertRaises(HTTPException):
+            server.download_record("child-1")
+        self.assertEqual(self.library()["items"], [])
+        with self.assertRaises(HTTPException) as error:
+            server.get_playlist("playlist-1")
+        self.assertEqual(error.exception.status_code, 404)
+
+    def test_deleting_playlist_moves_local_files_to_trash_by_default(self) -> None:
+        self.insert_playlist("playlist-1")
+        media_path = self.root / "downloads" / "child-1.mp4"
+        media_path.parent.mkdir(parents=True)
+        media_path.write_bytes(b"video")
+        self.insert_download(
+            "child-1",
+            playlist_id="playlist-1",
+            file_path=str(media_path),
+            download_dir=str(media_path.parent),
+        )
+
+        with patch.object(server, "move_to_trash") as move_to_trash:
+            deleted = server.delete_playlist("playlist-1")
+
+        move_to_trash.assert_called_once_with(media_path.resolve())
+        self.assertEqual(deleted["trashed_files"], [str(media_path.resolve())])
+        with self.assertRaises(HTTPException):
+            server.download_record("child-1")
 
     def test_library_filters_playlist_by_collection_or_child_information(self) -> None:
         self.insert_playlist("playlist-1", title="陶艺教程")

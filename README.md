@@ -32,7 +32,7 @@
 
 磁力链接能否获得文件列表或开始下载，取决于公共元数据缓存、DHT、网络代理和可用节点。需要登录的网站可能还需要在设置中配置浏览器 Cookie。
 
-项目暂不提供安装包、自动更新、云同步、移动端同步、自定义标签、时间点笔记、AI 识别或转写，也不提供直播电视功能。普通网页中的 HLS / `.m3u8` 媒体仍可由 `yt-dlp` 下载。
+项目提供面向 Apple Silicon macOS 和 Windows x64 的 Tauri 安装包构建链路；自动更新、云同步、移动端同步、自定义标签、时间点笔记、AI 识别或转写仍不在范围内，也不提供直播电视功能。普通网页中的 HLS / `.m3u8` 媒体仍可由 `yt-dlp` 下载。
 
 ## 系统要求
 
@@ -70,6 +70,32 @@ open "dist/Video Downloader.app"
 `make install` 会在 `backend/.venv` 创建 Python 虚拟环境，并安装前端依赖。桌面应用不会把 Python、FFmpeg、aria2 或 qBittorrent 打进应用包，而是使用项目目录和系统中已安装的依赖。
 
 构建完成后，应用位于 `dist/Video Downloader.app`。移动或重命名项目目录后，需要重新运行 `make macos-app`。
+
+## 可分发安装包
+
+Tauri 安装包会内置 React 界面、Python/FastAPI 下载服务、`ffmpeg`、`ffprobe` 和 `aria2c`；用户不需要安装源码、Python、Node、FFmpeg 或 aria2。qBittorrent 仍是可选的外部 Web UI 客户端，和现有功能一致。
+
+在 Apple Silicon Mac 上构建 DMG：
+
+```bash
+make install
+make install-desktop-tools
+make tauri-macos
+```
+
+产物位于 `desktop/tauri/target/release/bundle/dmg/`。首次构建会将本机 Homebrew 的 `ffmpeg`、`ffprobe`、`aria2c` 及其动态库复制、改写为独立运行时；不会修改系统安装。
+
+Windows 安装程序必须在 Windows x64 主机构建，不能从 macOS 交叉编译 Python 后端。先把可携带的 `ffmpeg.exe`、`ffprobe.exe`、`aria2c.exe` 放到 `desktop/runtime/x86_64-pc-windows-msvc/bin/`，然后在 PowerShell 中运行：
+
+```powershell
+py -3 -m venv backend/.venv
+backend/.venv/Scripts/python.exe -m pip install -e "backend[test]" pyinstaller
+npm --prefix frontend install
+backend/.venv/Scripts/python.exe scripts/build_tauri_sidecar.py
+npm --prefix frontend run tauri:build
+```
+
+Windows 安装程序位于 `desktop/tauri/target/release/bundle/nsis/`。macOS 构建默认使用 ad-hoc 签名，供本机测试或手动放行；正式发给他人前，设置 `APPLE_SIGNING_IDENTITY` 为 Developer ID Application 证书，并配置 Apple 公证凭据后重新构建。Windows 正式分发同样需要 Authenticode 签名。
 
 ## 基本使用
 

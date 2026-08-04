@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +20,20 @@ def load_launcher():
 
 
 class LauncherTests(unittest.TestCase):
+    def test_desktop_port_zero_reserves_an_ephemeral_loopback_socket(self) -> None:
+        with patch.dict(os.environ, {"VIDEO_DOWNLOADER_DESKTOP": "1", "VIDEO_DOWNLOADER_PORT": "0"}, clear=True):
+            launcher = load_launcher()
+            listener = MagicMock()
+            listener.getsockname.return_value = ("127.0.0.1", 43210)
+            with (
+                patch.object(launcher.socket, "socket", return_value=listener),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertIs(launcher.bind_desktop_socket(), listener)
+        listener.bind.assert_called_once_with(("127.0.0.1", 0))
+        listener.listen.assert_called_once()
+        self.assertIn("http://127.0.0.1:43210", output.getvalue())
+
     def test_browser_opens_only_after_health_is_ready(self) -> None:
         launcher = load_launcher()
         response = MagicMock()

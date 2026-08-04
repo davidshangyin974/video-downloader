@@ -6,9 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "check": "tsc -b"
+    "check": "tsc -b",
+    "tauri:dev": "cd ../desktop/tauri && ../../frontend/node_modules/.bin/tauri dev",
+    "tauri:build": "cd ../desktop/tauri && ../../frontend/node_modules/.bin/tauri build"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
     "@vitejs/plugin-react": "latest",
     "plyr": "^3.8.4",
     "react": "latest",
@@ -17,6 +20,7 @@
     "wavesurfer.js": "^7.12.11"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "typescript": "latest"

@@ -98,6 +98,15 @@ class SlowRangeHandler(BaseHTTPRequestHandler):
 
 
 class EngineChainTests(unittest.TestCase):
+    def test_async_inspect_start_route_accepts_post(self) -> None:
+        route = next(
+            route
+            for route in server.app.routes
+            if route.path == "/api/v1/downloads/inspect/start"
+        )
+
+        self.assertIn("POST", route.methods)
+
     def test_download_formats_list_best_quality_first(self) -> None:
         formats = server.format_options({
             "formats": [
