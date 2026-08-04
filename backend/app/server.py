@@ -169,6 +169,8 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5174",
         "http://localhost:5174",
+        "http://tauri.localhost",
+        "tauri://localhost",
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
@@ -3481,10 +3483,10 @@ def ffmpeg_version() -> str | None:
             [executable, "-version"],
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=10,
             check=False,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     first_line = result.stdout.splitlines()[0] if result.stdout else ""
     parts = first_line.split()
@@ -3658,6 +3660,7 @@ def delete_source_follow(follow_id: str) -> dict[str, str]:
     return {"id": follow_id}
 
 
+@app.post("/api/v1/downloads/inspect/start")
 async def start_inspect(request: InspectRequest) -> dict[str, Any]:
     source = prepare_inspect_source(request)
     inspect_id = str(uuid.uuid4())
@@ -4780,6 +4783,125 @@ def update_playlist_favorite(
             (int(request.favorite), now(), playlist_id),
         )
     return {"id": playlist_id, "favorite": int(request.favorite)}
+
+
+@app.delete("/api/v1/playlists/{playlist_id}")
+def delete_playlist(
+    playlist_id: str, remove_files: bool = Query(default=True)
+) -> dict[str, Any]:
+    playlist_record(playlist_id)
+    with connection() as database:
+        rows = database.execute(
+            "SELECT id FROM downloads WHERE playlist_id = ?",
+            (playlist_id,),
+        ).fetchall()
+
+    videos = [download_record(row["id"]) for row in rows]
+    active_videos = [
+        video for video in videos
+        if video["status"] in {"queued", "running", "processing", "paused"}
+    ]
+    if active_videos:
+        raise HTTPException(status_code=409, detail="合集内仍有未结束的下载，请先取消下载后再删除合集。")
+
+    with connection() as database:
+        for video in videos:
+            active_denoise_job = database.execute(
+                "SELECT id FROM video_denoise_jobs WHERE download_id = ? AND status IN ('queued', 'running')",
+                (video["id"],),
+            ).fetchone()
+            active_media_job = database.execute(
+                "SELECT id FROM media_derivative_jobs WHERE download_id = ? AND status IN ('queued', 'running')",
+                (video["id"],),
+            ).fetchone()
+            if active_denoise_job or active_media_job:
+                raise HTTPException(status_code=409, detail="合集内仍有正在处理的视频，请完成后再删除合集。")
+
+    trashed_files: list[str] = []
+    if remove_files:
+        files_to_trash: list[Path] = []
+        for video in videos:
+            if video["status"] != "completed":
+                files_to_trash.extend(incomplete_task_files(video))
+                continue
+            if not video.get("file_path"):
+                continue
+            try:
+                media_path, download_dir = local_video_path(video)
+            except HTTPException as error:
+                if error.status_code == 404:
+                    continue
+                raise
+            for file_path in related_video_files(media_path):
+                try:
+                    file_path.relative_to(download_dir)
+                except ValueError as error:
+                    raise HTTPException(status_code=409, detail="合集包含不安全的关联文件，未删除合集。") from error
+                files_to_trash.append(file_path)
+
+            derivative_dir = (download_dir / ".video-downloader" / "denoise").resolve()
+            with connection() as database:
+                denoise_rows = database.execute(
+                    "SELECT file_path FROM video_denoise_jobs WHERE download_id = ?",
+                    (video["id"],),
+                ).fetchall()
+            for denoise_row in denoise_rows:
+                if not denoise_row["file_path"]:
+                    continue
+                derivative_path = Path(denoise_row["file_path"]).resolve()
+                try:
+                    derivative_path.relative_to(derivative_dir)
+                except ValueError as error:
+                    raise HTTPException(status_code=409, detail="合集包含不安全的历史副本，未删除合集。") from error
+                if derivative_path.is_file():
+                    files_to_trash.append(derivative_path)
+
+        for file_path in dict.fromkeys(files_to_trash):
+            try:
+                move_to_trash(file_path)
+                trashed_files.append(str(file_path))
+            except RuntimeError as error:
+                raise HTTPException(status_code=409, detail=f"部分本地文件未能移入废纸篓，合集记录已保留：{error}") from error
+
+    for video in videos:
+        if video["engine"] != "qbittorrent" or not video.get("engine_task_id"):
+            continue
+        try:
+            qbittorrent_client().delete(str(video["engine_task_id"]), delete_files=False)
+        except qbittorrent.QbittorrentError as error:
+            raise HTTPException(status_code=409, detail=f"qBittorrent 任务尚未移除，合集记录已保留：{error}") from error
+
+    with connection() as database:
+        for video in videos:
+            database.execute("DELETE FROM download_logs WHERE download_id = ?", (video["id"],))
+            database.execute("DELETE FROM video_denoise_jobs WHERE download_id = ?", (video["id"],))
+            database.execute("DELETE FROM media_derivative_jobs WHERE download_id = ?", (video["id"],))
+            database.execute(
+                """
+                UPDATE media_derivative_jobs
+                SET status = 'failed', file_path = NULL, file_size = NULL,
+                    library_video_id = NULL, error = '兼容副本已从媒体库删除。', updated_at = ?
+                WHERE library_video_id = ?
+                """,
+                (now(), video["id"]),
+            )
+            database.execute("UPDATE downloads SET upgrade_from_id = NULL WHERE upgrade_from_id = ?", (video["id"],))
+            database.execute("DELETE FROM downloads WHERE id = ?", (video["id"],))
+        database.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+
+    for video in videos:
+        if (
+            video.get("file_origin") == "local"
+            and video.get("thumbnail") == f"/api/v1/videos/{video['id']}/thumbnail"
+        ):
+            local_video_thumbnail_path(video["id"]).unlink(missing_ok=True)
+
+    events.publish({"type": "playlist_deleted", "playlist_id": playlist_id})
+    return {
+        "id": playlist_id,
+        "deleted_video_count": len(videos),
+        "trashed_files": trashed_files,
+    }
 
 
 @app.get("/api/v1/downloads/{download_id}/logs")
@@ -6955,7 +7077,9 @@ def event_stream() -> StreamingResponse:
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+FRONTEND_DIST = Path(
+    os.environ.get("VIDEO_DOWNLOADER_FRONTEND_DIST", Path(__file__).resolve().parents[2] / "frontend" / "dist")
+)
 if FRONTEND_DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="frontend-assets")
 

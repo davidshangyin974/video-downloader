@@ -614,7 +614,7 @@ type LibraryScanReport = {
   failed: Array<{ path: string, error: string }>
 }
 
-const apiBase = import.meta.env.VITE_API_BASE_URL ?? ''
+const apiBase = window.__VIDEO_DOWNLOADER_API_BASE__ ?? import.meta.env.VITE_API_BASE_URL ?? ''
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly body: unknown) {
@@ -839,10 +839,6 @@ function platformLabel(task: Download) {
   }
 }
 
-function engineLabel(engine: Download['engine']) {
-  return { 'yt-dlp': 'yt-dlp', aria2: 'aria2', qbittorrent: 'qBittorrent', local: '本地文件' }[engine]
-}
-
 function sourceTypeLabel(sourceType: string | null) {
   return {
     webpage: '网页媒体',
@@ -1044,7 +1040,7 @@ function SettingSelect({
   </div>
 }
 
-type IconName = 'add' | 'check' | 'close' | 'download' | 'expand' | 'collapse' | 'play' | 'pause' | 'previous' | 'next' | 'repeat' | 'search' | 'details' | 'trash' | 'library' | 'settings' | 'star' | 'more' | 'video' | 'audio' | 'playlist'
+type IconName = 'add' | 'check' | 'close' | 'download' | 'expand' | 'collapse' | 'play' | 'pause' | 'previous' | 'next' | 'repeat' | 'search' | 'details' | 'help' | 'trash' | 'library' | 'settings' | 'star' | 'more' | 'video' | 'audio' | 'playlist'
 
 function Icon({ name, size = 16 }: { name: IconName, size?: number }) {
   const paths: Record<IconName, ReactNode> = {
@@ -1061,9 +1057,10 @@ function Icon({ name, size = 16 }: { name: IconName, size?: number }) {
     repeat: <><path d="m17 2 4 4-4 4" /><path d="M3 11V9a3 3 0 0 1 3-3h15" /><path d="m7 22-4-4 4-4" /><path d="M21 13v2a3 3 0 0 1-3 3H3" /></>,
     search: <><circle cx="11" cy="11" r="6" /><path d="m16 16 4 4" /></>,
     details: <><circle cx="12" cy="12" r="8" /><path d="M12 11v5" /><path d="M12 8h.01" /></>,
+    help: <><circle cx="12" cy="12" r="8" /><path d="M9.7 9.4a2.5 2.5 0 1 1 4.1 1.9c-.9.7-1.8 1.3-1.8 2.7" /><path d="M12 17h.01" /></>,
     trash: <><path d="M5 7h14" /><path d="M10 11v5M14 11v5" /><path d="M8 7l1-3h6l1 3" /><path d="M7 7l1 13h8l1-13" /></>,
     library: <><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m10 9 5 3-5 3Z" fill="currentColor" stroke="none" /></>,
-    settings: <><path d="M4 7h16M4 12h16M4 17h16" /><circle cx="9" cy="7" r="1.5" fill="currentColor" stroke="none" /><circle cx="15" cy="12" r="1.5" fill="currentColor" stroke="none" /><circle cx="11" cy="17" r="1.5" fill="currentColor" stroke="none" /></>,
+    settings: <><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.72l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" /><circle cx="12" cy="12" r="3" /></>,
     star: <path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z" />,
     more: <><circle cx="5" cy="12" r="1.4" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" /><circle cx="19" cy="12" r="1.4" fill="currentColor" stroke="none" /></>,
     video: <><rect x="3" y="6" width="18" height="12" rx="2" /><path d="m10 9 5 3-5 3Z" fill="currentColor" stroke="none" /></>,
@@ -1071,6 +1068,36 @@ function Icon({ name, size = 16 }: { name: IconName, size?: number }) {
     playlist: <><path d="M4 7h10M4 12h10M4 17h7" /><path d="m16 14 5 3-5 3Z" fill="currentColor" stroke="none" /></>,
   }
   return <svg className="ui-icon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>
+}
+
+function downloadFormatTitle(format: DownloadFormat): string {
+  return format.resolution || format.label
+}
+
+function downloadFormatMeta(format: DownloadFormat): string {
+  return [
+    format.extension?.toUpperCase(),
+    format.fps ? `${format.fps} fps` : null,
+    format.file_size_label || '大小未知',
+  ].filter(Boolean).join(' · ')
+}
+
+function DownloadFormatPicker({ formats, value, onChange }: { formats: DownloadFormat[], value: string | null, onChange: (formatId: string | null) => void }) {
+  if (formats.length === 0) return <div className="format-picker-empty">自动选择最佳格式</div>
+  const selected = formats.find((format) => format.format_id === value) || formats[0]
+  return (
+    <details className="format-picker-menu">
+      <summary aria-label="选择下载格式">
+        <span><b>{downloadFormatTitle(selected)}</b><small>{downloadFormatMeta(selected)}</small></span>
+      </summary>
+      <div className="format-picker-options" role="listbox" aria-label="可用下载格式">
+        {formats.map((format) => <button key={format.format_id} type="button" role="option" aria-selected={format.format_id === selected.format_id} className={format.format_id === selected.format_id ? 'is-selected' : ''} onClick={(event) => {
+          onChange(format.format_id)
+          event.currentTarget.closest('details')?.removeAttribute('open')
+        }}><span><b>{downloadFormatTitle(format)}</b><small>{downloadFormatMeta(format)}</small></span><i>{format.format_id === selected.format_id ? '已选' : '选择'}</i></button>)}
+      </div>
+    </details>
+  )
 }
 
 type AudioWavePlayerProps = {
@@ -1329,6 +1356,7 @@ export default function App() {
   const videoDetailMenuId = useId()
   const [videoDetailMenuOpen, setVideoDetailMenuOpen] = useState(false)
   const [playerVideo, setPlayerVideo] = useState<Download | null>(null)
+  const [playerFullscreen, setPlayerFullscreen] = useState(false)
   const [playlistVideos, setPlaylistVideos] = useState<Download[]>([])
   const [playerNotice, setPlayerNotice] = useState<string | null>(null)
   const [videoCompatibility, setVideoCompatibility] = useState<VideoCompatibility | null>(null)
@@ -1346,6 +1374,10 @@ export default function App() {
   const [deletePreviewLoading, setDeletePreviewLoading] = useState(false)
   const [deletingVideo, setDeletingVideo] = useState(false)
   const [removeVideoFile, setRemoveVideoFile] = useState(true)
+  const [collectionToDelete, setCollectionToDelete] = useState<LibraryPlaylist | null>(null)
+  const [deletingCollection, setDeletingCollection] = useState(false)
+  const [collectionDeleteNotice, setCollectionDeleteNotice] = useState<string | null>(null)
+  const [removeCollectionFiles, setRemoveCollectionFiles] = useState(true)
   const [renameVideoTarget, setRenameVideoTarget] = useState<Download | null>(null)
   const [renameVideoTitle, setRenameVideoTitle] = useState('')
   const [renameVideoFile, setRenameVideoFile] = useState(false)
@@ -1640,7 +1672,7 @@ export default function App() {
       setSelectedVideo(video)
     } catch {
       if (selectedVideoIdRef.current !== videoId) return
-      setSelectedVideo(null)
+      setVideoActionNotice('详情完整信息读取失败，已显示列表信息。')
     }
   }, [])
 
@@ -1765,9 +1797,13 @@ export default function App() {
       setSelectedVideo(null)
       return
     }
-    setSelectedVideo((current) => current?.id === selectedVideoId ? current : null)
+    setSelectedVideo((current) => current?.id === selectedVideoId
+      ? current
+      : selectedLibraryItem?.kind === 'video' && selectedLibraryItem.id === selectedVideoId
+        ? selectedLibraryItem
+        : null)
     void refreshVideoDetail(selectedVideoId)
-  }, [refreshVideoDetail, selectedVideoId])
+  }, [refreshVideoDetail, selectedLibraryItem, selectedVideoId])
 
   useEffect(() => {
     setVideoDetailMenuOpen(false)
@@ -1998,11 +2034,23 @@ export default function App() {
       keyboard: { focused: true, global: true },
       fullscreen: {
         enabled: true,
-        fallback: true,
+        fallback: 'force',
         iosNative: true,
       },
     })
-    return () => player.destroy()
+    const handleEnterFullscreen = () => setPlayerFullscreen(true)
+    const handleExitFullscreen = () => setPlayerFullscreen(false)
+    player.on('enterfullscreen', handleEnterFullscreen)
+    player.on('exitfullscreen', handleExitFullscreen)
+    return () => {
+      player.off('enterfullscreen', handleEnterFullscreen)
+      player.off('exitfullscreen', handleExitFullscreen)
+      player.destroy()
+    }
+  }, [playerVideo?.id])
+
+  useEffect(() => {
+    setPlayerFullscreen(false)
   }, [playerVideo?.id])
 
   useEffect(() => {
@@ -2231,14 +2279,6 @@ export default function App() {
 
   function openNewDownload() {
     setModalOpen(true)
-    if (url.trim() || torrentFile || !navigator.clipboard?.readText) return
-    void navigator.clipboard.readText().then((text) => {
-      const clipboardUrls = downloadInputLines(text)
-      if (clipboardUrls.length === 0) return
-      setUrl(clipboardUrls.join('\n'))
-      setEngineHint('auto')
-      setNotice(clipboardUrls.length > 1 ? `已从剪贴板识别 ${clipboardUrls.length} 个链接。` : '已从剪贴板识别下载链接。')
-    }).catch(() => undefined)
   }
 
   function openSourceFollows(prefillUrl = '') {
@@ -2361,7 +2401,7 @@ export default function App() {
       const providers = await api<ResourceSearchProvider[]>('/api/v1/search/providers')
       setResourceSearchProviders(providers)
       setResourceSearchProvider(providers[0]?.key || '')
-      if (providers.length === 0) setResourceSearchNotice('当前 yt-dlp 没有可用的关键词搜索平台。')
+      if (providers.length === 0) setResourceSearchNotice('当前没有可用的关键词搜索平台。')
     } catch (error) {
       setResourceSearchNotice(error instanceof Error ? error.message : '无法读取搜索平台。')
     } finally {
@@ -2477,7 +2517,7 @@ export default function App() {
   function selectLibraryItem(item: LibraryItem) {
     setSelectedLibraryKey(libraryItemKey(item))
     setSelectedVideoId(item.kind === 'video' ? item.id : null)
-    setSelectedVideo(null)
+    setSelectedVideo(item.kind === 'video' ? item : null)
     setVideoActionNotice(null)
   }
 
@@ -3100,7 +3140,6 @@ export default function App() {
       'Video Downloader 失败诊断',
       `任务 ID：${task.id}`,
       `输入类型：${sourceTypeLabel(task.source_type)}`,
-      `下载引擎：${engineLabel(task.engine)} ${task.engine_version || ''}`.trim(),
       `任务状态：${task.status}`,
       `原始输入：${task.source_url}`,
       task.resolved_url && task.resolved_url !== task.source_url ? `实际地址：${task.resolved_url}` : null,
@@ -3413,7 +3452,7 @@ export default function App() {
           maintenance: savedSettings.maintenance,
         }),
       } : savedSettings)
-      setSettingsNotice(`${tab === 'general' ? '通用设置' : tab === 'yt-dlp' ? 'yt-dlp 参数' : tab === 'ffmpeg' ? 'ffmpeg 参数' : tab === 'aria2' ? 'aria2 设置' : tab === 'qbittorrent' ? 'qBittorrent 设置' : '清理设置'}已保存。`)
+      setSettingsNotice(`${tab === 'general' ? '下载设置' : tab === 'yt-dlp' ? '网页下载设置' : tab === 'ffmpeg' ? '媒体处理设置' : tab === 'aria2' ? '直链与 BT 设置' : tab === 'qbittorrent' ? 'BT 客户端设置' : '清理设置'}已保存。`)
     } catch (error) {
       setSettingsNotice(error instanceof Error ? error.message : '设置未保存，请稍后重试。')
     } finally {
@@ -3428,7 +3467,7 @@ export default function App() {
       const result = await api<YtDlpUpdateCheck>('/api/v1/settings/yt-dlp/update-check?refresh=true')
       setYtDlpUpdate(result)
     } catch (error) {
-      setSettingsNotice(error instanceof Error ? error.message : '无法检查 yt-dlp 更新。')
+      setSettingsNotice(error instanceof Error ? error.message : '无法检查下载组件更新。')
     } finally {
       setYtDlpUpdateWorking(false)
     }
@@ -3780,6 +3819,43 @@ export default function App() {
     if (shouldRemoveFile) loadVideoDeletePreview(video)
   }
 
+  function preparePlaylistDelete(playlist: LibraryPlaylist) {
+    setCollectionDeleteNotice(null)
+    setRemoveCollectionFiles(true)
+    setCollectionToDelete(playlist)
+  }
+
+  async function deletePlaylist() {
+    if (!collectionToDelete) return
+    setDeletingCollection(true)
+    setCollectionDeleteNotice(null)
+    try {
+      await api<{ id: string }>(`/api/v1/playlists/${collectionToDelete.id}?remove_files=${removeCollectionFiles}`, { method: 'DELETE' })
+      closeLibraryDetail()
+      setCollectionToDelete(null)
+      await Promise.all([
+        refreshVideos({
+          title: search,
+          platforms: videoPlatforms,
+          fileFormats: videoFileFormats,
+          resolution: videoResolution,
+          mediaType: 'video',
+          fileStatus: videoFileStatus,
+          favoriteOnly: videoFavoritesOnly,
+          page: videoPage,
+          pageSize: videoPageSize,
+          sortBy: videoSortBy,
+          sortOrder: videoSortOrder,
+        }),
+        refreshVideoFilterItems(),
+      ])
+    } catch (error) {
+      setCollectionDeleteNotice(error instanceof Error ? error.message : '合集未删除，请稍后重试。')
+    } finally {
+      setDeletingCollection(false)
+    }
+  }
+
   return (
     <main className="app-shell">
       <a className="skip-link" href="#workspace-main">跳到主要内容</a>
@@ -3799,19 +3875,28 @@ export default function App() {
           <button className={page === 'tasks' ? 'nav-item is-active' : 'nav-item'} onClick={() => setPage('tasks')}>
             <span className="nav-item-label"><Icon name="download" size={17} /><span>下载任务</span></span><b>{taskCounts.active}</b>
           </button>
-          <button className={page === 'settings' ? 'nav-item is-active' : 'nav-item'} onClick={() => setPage('settings')}>
+          <button className={page === 'settings' ? 'nav-item settings-nav-item is-active' : 'nav-item settings-nav-item'} onClick={() => setPage('settings')}>
             <span className="nav-item-label"><Icon name="settings" size={17} /><span>系统设置</span></span>
           </button>
         </nav>
 
         <div className="sidebar-footer">
-          <div className="sidebar-legal">
-            <small>本地工具 · 不内置媒体链接</small>
-            <div><button type="button" onClick={() => setLegalModal('open-source')}>开源与致谢</button><span>·</span><button type="button" onClick={() => setLegalModal('disclaimer')}>使用与免责</button></div>
-          </div>
-          <div className="engine-status" aria-live="polite">
-            <span className={health ? 'dot is-online' : 'dot'} />
-            <div><b>{health ? '下载服务已就绪' : '正在连接本地服务'}</b><small>{health ? `${health.engine} · ${health.engines?.qbittorrent?.available ? `qBittorrent ${health.engines.qbittorrent.version}` : health.engines?.aria2.version || 'aria2'}` : '请确认本地服务已启动'}</small></div>
+          <div className="sidebar-utility-row">
+            <button
+              className={page === 'settings' ? 'sidebar-settings-button is-active' : 'sidebar-settings-button'}
+              type="button"
+              onClick={() => setPage('settings')}
+              aria-label="系统设置"
+              title="系统设置"
+            >
+              <Icon name="settings" size={18} />
+            </button>
+            <details className="sidebar-about">
+              <summary aria-label="关于与许可" title="关于与许可"><Icon name="help" size={18} /></summary>
+              <div><button type="button" onClick={(event) => { event.currentTarget.closest('details')?.removeAttribute('open'); setLegalModal('open-source') }}>开源与致谢</button><button type="button" onClick={(event) => { event.currentTarget.closest('details')?.removeAttribute('open'); setLegalModal('disclaimer') }}>使用与免责</button></div>
+            </details>
+            <span className={health ? 'sidebar-status-dot is-ready' : 'sidebar-status-dot'} role="status" aria-label={health ? '本地下载工具已准备好' : '正在连接本地下载工具'} title={health ? '本地下载工具已准备好' : '正在连接本地下载工具'} />
+            <small className="sidebar-version">v{health?.application?.version || '0.1.0'}</small>
           </div>
         </div>
       </aside>
@@ -3826,14 +3911,12 @@ export default function App() {
               <button className="mobile-top-actions-trigger" type="button" aria-label="更多页面操作" aria-haspopup="menu" aria-expanded={mobileTopActionsOpen} onClick={() => setMobileTopActionsOpen((current) => !current)}><Icon name="more" size={18} /></button>
               {mobileTopActionsOpen && <div className="mobile-top-actions-menu" role="menu">
                 {(page === 'videos' || page === 'audio') && <button type="button" role="menuitem" onClick={() => { setMobileTopActionsOpen(false); openLocalVideo() }}><Icon name="library" size={16} />添加本地媒体</button>}
-                {page === 'videos' && <button type="button" role="menuitem" onClick={() => { setMobileTopActionsOpen(false); openSourceFollows() }}><Icon name="repeat" size={16} />关注更新</button>}
                 <button type="button" role="menuitem" onClick={() => { setMobileTopActionsOpen(false); void openResourceSearch() }}><Icon name="search" size={16} />搜索资源</button>
               </div>}
             </div>
             {(page === 'videos' || page === 'audio') && <button className="resource-search-button" onClick={openLocalVideo} aria-label="添加本地媒体"><Icon name="library" size={17} /><span>添加本地媒体</span></button>}
-            {page === 'videos' && <button className="resource-search-button" onClick={() => openSourceFollows()} aria-label="关注更新"><Icon name="repeat" size={17} /><span>关注更新{sourceFollows.some((follow) => follow.new_count > 0) ? ` · ${sourceFollows.reduce((total, follow) => total + follow.new_count, 0)}` : ''}</span></button>}
             <button className="resource-search-button" onClick={() => void openResourceSearch()} aria-label="搜索资源"><Icon name="search" size={17} /><span>搜索资源</span></button>
-            <button className="new-task-button compact-new-task" onClick={openNewDownload} aria-label="新建下载"><Icon name="add" size={17} /><span>新建下载</span></button>
+            <button className="new-task-button compact-new-task" onClick={openNewDownload} aria-label="粘贴链接下载"><Icon name="add" size={17} /><span>粘贴链接</span></button>
           </div>}
         </header>
 
@@ -3887,7 +3970,7 @@ export default function App() {
                           <td className="title-cell">
                             <div className="title-cell-content">
                               <div className="mini-cover">{task.thumbnail ? <img src={task.thumbnail} alt="" onError={(event) => { event.currentTarget.onerror = null; event.currentTarget.src = videoPlaceholder }} /> : <img src={videoPlaceholder} alt="" />}</div>
-                              <div><b>{task.title || '正在解析链接…'}</b><small>{task.playlist_id ? playlistLabel(task) : `${sourceTypeLabel(task.source_type)} · ${engineLabel(task.engine)}`}</small></div>
+                              <div><b>{task.title || '正在解析链接…'}</b><small>{task.playlist_id ? playlistLabel(task) : sourceTypeLabel(task.source_type)}</small></div>
                             </div>
                           </td>
                           <td className="task-state-cell"><div><span className={`status status-${task.status}`}>{taskStatusLabel(task)}</span><b>{Math.round(task.progress)}%</b></div><span className="progress-track"><i style={{ width: `${Math.max(task.progress, task.status === 'queued' ? 2 : 0)}%` }} /></span></td>
@@ -3912,7 +3995,7 @@ export default function App() {
               <aside className="detail-panel task-detail-drawer" aria-label="下载详情">
                 <header className="detail-header detail-identity">
                   <div className="detail-cover"><img src={selectedTask?.thumbnail || videoPlaceholder} alt="" onError={(event) => { event.currentTarget.onerror = null; event.currentTarget.src = videoPlaceholder }} /></div>
-                  <div><p className="eyebrow">任务详情</p><h2>{selectedTask?.title || '正在读取下载信息…'}</h2>{selectedTask && <p className="detail-subtitle">{platformLabel(selectedTask)} · {sourceTypeLabel(selectedTask.source_type)} · {engineLabel(selectedTask.engine)}</p>}</div>
+                  <div><p className="eyebrow">任务详情</p><h2>{selectedTask?.title || '正在读取下载信息…'}</h2>{selectedTask && <p className="detail-subtitle">{platformLabel(selectedTask)} · {sourceTypeLabel(selectedTask.source_type)}</p>}</div>
                   <button ref={taskDetailCloseRef} className="icon-button task-detail-close" type="button" onClick={() => { setTaskDetailDismissed(true); setSelectedTaskId(null) }} aria-label="关闭任务详情" title="关闭任务详情"><Icon name="close" size={18} /></button>
                 </header>
 
@@ -3934,7 +4017,6 @@ export default function App() {
                   <section className="detail-section">
                     <div className="detail-section-heading"><h3>任务信息</h3><span>{dateLabel(selectedTask.created_at)} 开始</span></div>
                     <dl className="detail-grid">
-                      <div><dt>下载引擎</dt><dd>{engineLabel(selectedTask.engine)}</dd></div>
                       <div><dt>输入类型</dt><dd>{sourceTypeLabel(selectedTask.source_type)}</dd></div>
                       <div><dt>任务优先级</dt><dd>{priorityLabel(selectedTask.priority)}</dd></div>
                       <div><dt>队列位置</dt><dd>{selectedTask.queue_position ? `第 ${selectedTask.queue_position} 位` : '—'}</dd></div>
@@ -4008,29 +4090,30 @@ export default function App() {
                 </button>
               </div>
               <div className="active-filter-bar" aria-label="已应用筛选">
-                <span>已筛选</span>
-                {!search && videoPlatforms.length === 0 && videoFileFormats.length === 0 && (page === 'audio' || !videoResolution) && videoFileStatus === 'all' && !videoFavoritesOnly && <span className="active-filter-empty">全部内容</span>}
-                {videoPlatforms.map((platform) => <button type="button" key={`platform-${platform}`} onClick={() => toggleVideoPlatform(platform)}><small>平台</small>{platform}<Icon name="close" size={13} /></button>)}
-                {videoFileFormats.map((format) => <button type="button" key={`format-${format}`} onClick={() => toggleVideoFileFormat(format)}><small>格式</small>{format.toUpperCase()}<Icon name="close" size={13} /></button>)}
-                {page === 'videos' && videoResolution && <button type="button" onClick={() => { setVideoResolution(''); setVideoPage(1) }}><small>清晰度</small>{videoResolution}<Icon name="close" size={13} /></button>}
-                {videoFileStatus !== 'all' && <button type="button" onClick={() => { setVideoFileStatus('all'); setVideoPage(1) }}><small>文件状态</small>{videoFileStatus === 'missing' ? '文件不存在' : '文件可用'}<Icon name="close" size={13} /></button>}
-                {videoFavoritesOnly && <button type="button" onClick={() => { setVideoFavoritesOnly(false); setVideoPage(1) }}><small>收藏</small>只看收藏<Icon name="close" size={13} /></button>}
-                {(search || videoPlatforms.length > 0 || videoFileFormats.length > 0 || (page === 'videos' && videoResolution) || videoFileStatus !== 'all' || videoFavoritesOnly || videoSortBy !== 'created_at' || videoSortOrder !== 'desc') && <button type="button" className="clear-video-filters" onClick={clearVideoFilters}>全部重置</button>}
-              </div>
-              {videoBatchNotice && <p className="video-batch-notice" role="status">{videoBatchNotice}</p>}
-              {selectedVisibleVideoIds.length > 0 && <div className="video-selection-actions" role="status">
-                <span>已选 {selectedVisibleVideoIds.length} 项</span>
-                <div>
+                <div className="active-filter-content">
+                  <span>已筛选</span>
+                  {!search && videoPlatforms.length === 0 && videoFileFormats.length === 0 && (page === 'audio' || !videoResolution) && videoFileStatus === 'all' && !videoFavoritesOnly && <span className="active-filter-empty">全部内容</span>}
+                  {videoPlatforms.map((platform) => <button type="button" key={`platform-${platform}`} onClick={() => toggleVideoPlatform(platform)}><small>平台</small>{platform}<Icon name="close" size={13} /></button>)}
+                  {videoFileFormats.map((format) => <button type="button" key={`format-${format}`} onClick={() => toggleVideoFileFormat(format)}><small>格式</small>{format.toUpperCase()}<Icon name="close" size={13} /></button>)}
+                  {page === 'videos' && videoResolution && <button type="button" onClick={() => { setVideoResolution(''); setVideoPage(1) }}><small>清晰度</small>{videoResolution}<Icon name="close" size={13} /></button>}
+                  {videoFileStatus !== 'all' && <button type="button" onClick={() => { setVideoFileStatus('all'); setVideoPage(1) }}><small>文件状态</small>{videoFileStatus === 'missing' ? '文件不存在' : '文件可用'}<Icon name="close" size={13} /></button>}
+                  {videoFavoritesOnly && <button type="button" onClick={() => { setVideoFavoritesOnly(false); setVideoPage(1) }}><small>收藏</small>只看收藏<Icon name="close" size={13} /></button>}
+                  {(search || videoPlatforms.length > 0 || videoFileFormats.length > 0 || (page === 'videos' && videoResolution) || videoFileStatus !== 'all' || videoFavoritesOnly || videoSortBy !== 'created_at' || videoSortOrder !== 'desc') && <button type="button" className="clear-video-filters" onClick={clearVideoFilters}>全部重置</button>}
+                </div>
+                {selectedVisibleVideoIds.length > 0 && <div className="active-filter-actions" role="status">
+                  <span>已选 {selectedVisibleVideoIds.length} 项</span>
                   <button type="button" onClick={() => setVideoBatchAction('favorite')}><Icon name="star" size={14} />收藏</button>
                   <button type="button" onClick={() => setVideoBatchAction('unfavorite')}>取消收藏</button>
                   <button type="button" className="is-danger" onClick={() => setVideoBatchAction('remove')}><Icon name="trash" size={14} />移除记录</button>
-                </div>
-              </div>}
+                </div>}
+              </div>
+              {videoBatchNotice && <p className="video-batch-notice" role="status">{videoBatchNotice}</p>}
               {libraryItems.length === 0 ? (
                 <div className="empty-state empty-state-compact">
                   <span><Icon name="library" size={25} /></span>
                   <h2>{search || videoPlatforms.length || videoFileFormats.length || (page === 'videos' && videoResolution) || videoFileStatus !== 'all' || videoFavoritesOnly ? '没有符合筛选条件的内容' : `${page === 'audio' ? '音频' : '视频'}管理还是空的`}</h2>
-                  <p>{search || videoPlatforms.length || videoFileFormats.length || (page === 'videos' && videoResolution) || videoFileStatus !== 'all' || videoFavoritesOnly ? '调整搜索词或筛选条件后再试。' : `新建下载，或添加已有的本地${page === 'audio' ? '音频' : '视频'}文件。`}</p>
+                  <p>{search || videoPlatforms.length || videoFileFormats.length || (page === 'videos' && videoResolution) || videoFileStatus !== 'all' || videoFavoritesOnly ? '调整搜索词或筛选条件后再试。' : '从剪贴板粘贴链接即可开始下载，也可以添加已有的本地文件。'}</p>
+                  {!(search || videoPlatforms.length || videoFileFormats.length || (page === 'videos' && videoResolution) || videoFileStatus !== 'all' || videoFavoritesOnly) && <div className="empty-state-actions"><button className="new-task-button empty-paste-button" type="button" onClick={openNewDownload}><Icon name="add" size={17} />粘贴链接</button><button className="empty-state-secondary" type="button" onClick={openLocalVideo}>添加本地{page === 'audio' ? '音频' : '视频'}</button></div>}
                   {(search || videoPlatforms.length || videoFileFormats.length || (page === 'videos' && videoResolution) || videoFileStatus !== 'all' || videoFavoritesOnly) && <button className="text-button" onClick={clearVideoFilters}>清除筛选</button>}
                 </div>
               ) : (<>
@@ -4144,7 +4227,10 @@ export default function App() {
                   <header className="detail-header detail-identity">
                     <div className="detail-cover"><img src={selectedPlaylist.thumbnail || videoPlaceholder} alt="" onError={(event) => { event.currentTarget.onerror = null; event.currentTarget.src = videoPlaceholder }} /></div>
                     <div><p className="eyebrow">当前合集</p><h2 title={selectedPlaylist.title}>{selectedPlaylist.title}</h2><p className="detail-subtitle">{libraryPlatformLabel(selectedPlaylist)} · 共 {selectedPlaylist.total_count} 个</p></div>
-                    <button ref={videoDetailCloseRef} className="video-detail-close icon-button" type="button" onClick={closeLibraryDetail} aria-label="关闭合集详情"><Icon name="close" size={18} /></button>
+                    <div className="video-detail-header-actions">
+                      <button className="icon-button" type="button" onClick={() => preparePlaylistDelete(selectedPlaylist)} aria-label={`删除合集：${selectedPlaylist.title || '未命名合集'}`}><Icon name="trash" size={18} /></button>
+                      <button ref={videoDetailCloseRef} className="video-detail-close icon-button" type="button" onClick={closeLibraryDetail} aria-label="关闭合集详情"><Icon name="close" size={18} /></button>
+                    </div>
                   </header>
                   <section className="detail-section">
                     <div className="detail-section-heading"><h3>合集信息</h3><span>{dateLabel(selectedPlaylist.created_at)} 保存</span></div>
@@ -4177,7 +4263,7 @@ export default function App() {
             {settingsDraft ? (
               <div className="settings-tabs">
                 <div className="settings-tab-list" role="tablist" aria-label="下载配置类别">
-                  {([['general', '下载设置'], ['yt-dlp', 'yt-dlp'], ['ffmpeg', 'FFmpeg'], ['aria2', 'aria2'], ['qbittorrent', 'qBittorrent'], ['backup', '数据备份'], ['maintenance', '清理维护']] as Array<[SettingsTab, string]>).map(([tab, label]) => <button key={tab} type="button" role="tab" aria-selected={settingsTab === tab} className={settingsTab === tab ? 'is-active' : ''} onClick={() => { setSettingsTab(tab); setSettingsNotice(null); if (tab === 'maintenance') void refreshMaintenanceData() }}>{label}</button>)}
+                  {([['general', '下载设置'], ['yt-dlp', '网页下载'], ['ffmpeg', '媒体处理'], ['aria2', '直链与 BT'], ['qbittorrent', 'BT 客户端'], ['backup', '数据备份'], ['maintenance', '清理维护']] as Array<[SettingsTab, string]>).map(([tab, label]) => <button key={tab} type="button" role="tab" aria-selected={settingsTab === tab} className={settingsTab === tab ? 'is-active' : ''} onClick={() => { setSettingsTab(tab); setSettingsNotice(null); if (tab === 'maintenance') void refreshMaintenanceData() }}>{label}</button>)}
                 </div>
 
                 {settingsTab === 'general' && <section className="general-settings" role="tabpanel">
@@ -4186,7 +4272,7 @@ export default function App() {
                     <label><span><b>默认下载位置</b><small>下载完成后的文件保存目录。</small></span><input value={settingsDraft.download_dir} onChange={(event) => setSettingsDraft({ ...settingsDraft, download_dir: event.target.value })} placeholder="/Users/你的用户名/Movies" /></label>
                     <label><span><b>文件存放目录格式</b><small>新任务按此格式创建子目录。支持 platform、uploader、title、year、month、day 变量；留空则全部保存在默认位置。</small></span><input value={settingsDraft.directory_pattern} onChange={(event) => setSettingsDraft({ ...settingsDraft, directory_pattern: event.target.value })} placeholder={'{platform}/{year}-{month}/{title}'} /></label>
                     <div className="friendly-control-row"><span><b>同时下载任务数</b><small>高优先级任务会先进入这些并发位置。</small></span><SettingSelect ariaLabel="同时下载任务数" value={settingsDraft.max_concurrent_downloads} options={[{ value: '1', label: '1 个' }, { value: '2', label: '2 个' }, { value: '3', label: '3 个' }, { value: '5', label: '5 个' }, { value: '8', label: '8 个' }, { value: '10', label: '10 个' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, max_concurrent_downloads: Number(value) })} /></div>
-                    <label><span><b>单任务下载限速（KB/s）</b><small>对三个下载引擎生效；填写 0 表示不限速。</small></span><input type="number" min="0" max="1000000" value={settingsDraft.download_rate_limit_kbps} onChange={(event) => setSettingsDraft({ ...settingsDraft, download_rate_limit_kbps: Math.max(0, Number(event.target.value) || 0) })} /></label>
+                    <label><span><b>单任务下载限速（KB/s）</b><small>对所有下载方式生效；填写 0 表示不限速。</small></span><input type="number" min="0" max="1000000" value={settingsDraft.download_rate_limit_kbps} onChange={(event) => setSettingsDraft({ ...settingsDraft, download_rate_limit_kbps: Math.max(0, Number(event.target.value) || 0) })} /></label>
                     <label><span><b>完成后保留空间（MB）</b><small>创建任务和真正开始前都会检查；预计文件大小之外还需保留这部分空间。</small></span><input type="number" min="0" max="1000000" value={settingsDraft.minimum_free_space_mb} onChange={(event) => setSettingsDraft({ ...settingsDraft, minimum_free_space_mb: Math.max(0, Number(event.target.value) || 0) })} /></label>
                     <label><span><b>媒体目录</b><small>每行填写一个绝对路径。点击扫描后递归添加其中尚未入库的视频和音频。</small></span><textarea value={settingsDraft.library_dirs.join('\n')} onChange={(event) => setSettingsDraft({ ...settingsDraft, library_dirs: event.target.value.split('\n') })} placeholder={'/Users/你的用户名/Movies\n/Volumes/Video'} rows={3} /></label>
                     <label className="friendly-switch"><span><b>启动时增量扫描媒体目录</b><small>在后台只添加尚未入库的媒体，不复制源文件；目录不可访问时只记录失败。</small></span><input type="checkbox" checked={settingsDraft.scan_library_on_startup} onChange={(event) => setSettingsDraft({ ...settingsDraft, scan_library_on_startup: event.target.checked })} /></label>
@@ -4204,7 +4290,7 @@ export default function App() {
 
 
                 {settingsTab === 'yt-dlp' && <section className="general-settings engine-simple-settings" role="tabpanel">
-                  <header><p className="eyebrow">下载引擎</p><h2>yt-dlp 下载设置</h2><p>仅保留当前网页视频下载会用到的选项。</p></header>
+                  <header><p className="eyebrow">网页下载</p><h2>网页视频下载</h2><p>管理网页视频下载会用到的选项。</p></header>
                   <div className="friendly-form">
                     <div className="settings-version-check"><span><b>版本更新</b><small>{ytDlpUpdate ? `当前 ${ytDlpUpdate.current_version} · 最新 ${ytDlpUpdate.latest_version}` : `当前 ${health?.engine_version || '未知版本'}，仅检查更新，不会自动安装。`}</small>{ytDlpUpdate && <em className={ytDlpUpdate.update_available ? 'has-update' : ''}>{ytDlpUpdate.update_available ? '发现新版本' : '已经是最新版本'}</em>}</span><button className="cancel-button" type="button" onClick={() => void checkYtDlpUpdate()} disabled={ytDlpUpdateWorking}>{ytDlpUpdateWorking ? '正在检查…' : '检查更新'}</button></div>
                     <div className="friendly-control-row"><span><b>同时下载分片</b><small>多个小片段可同时下载；网络不稳定时保持“自动”。</small></span><SettingSelect ariaLabel="同时下载分片" value={settingsDraft.yt_dlp_simple.concurrent_fragments ?? ''} options={[{ value: '', label: '自动' }, { value: '2', label: '2 个' }, { value: '4', label: '4 个' }, { value: '8', label: '8 个' }, { value: '16', label: '16 个' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, yt_dlp_simple: { ...settingsDraft.yt_dlp_simple, concurrent_fragments: value ? Number(value) : null } })} /></div>
@@ -4217,11 +4303,11 @@ export default function App() {
                     <div className="friendly-control-row"><span><b>使用浏览器登录状态</b><small>下载需要登录的内容时读取本机浏览器 cookies。</small></span><SettingSelect ariaLabel="使用浏览器登录状态" value={configOptionValue(settingsDraft.yt_dlp_config, '--cookies-from-browser')} options={[{ value: '', label: '不使用' }, { value: 'chrome', label: 'Chrome' }, { value: 'firefox', label: 'Firefox' }, { value: 'safari', label: 'Safari' }, { value: 'edge', label: 'Edge' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, yt_dlp_config: updateConfigOption(settingsDraft.yt_dlp_config, '--cookies-from-browser', value) })} /></div>
                     <label><span><b>代理地址</b><small>仅在需要通过本机代理访问下载地址时填写。</small></span><input value={configOptionValue(settingsDraft.yt_dlp_config, '--proxy')} onChange={(event) => setSettingsDraft({ ...settingsDraft, yt_dlp_config: updateConfigOption(settingsDraft.yt_dlp_config, '--proxy', event.target.value.trim()) })} placeholder="http://127.0.0.1:7890" /></label>
                   </div>
-                  <footer className="tab-save-footer">{settingsNotice ? <p className="settings-notice" role="status">{settingsNotice}</p> : <span>仅保存 yt-dlp 下载设置。</span>}<button className="primary-button" type="button" onClick={() => saveSettings('yt-dlp')} disabled={savingSettings !== null}>{savingSettings === 'yt-dlp' ? '正在保存…' : '保存 yt-dlp 设置'}</button></footer>
+                  <footer className="tab-save-footer">{settingsNotice ? <p className="settings-notice" role="status">{settingsNotice}</p> : <span>仅保存网页下载设置。</span>}<button className="primary-button" type="button" onClick={() => saveSettings('yt-dlp')} disabled={savingSettings !== null}>{savingSettings === 'yt-dlp' ? '正在保存…' : '保存网页下载设置'}</button></footer>
                 </section>}
 
                 {settingsTab === 'ffmpeg' && <section className="general-settings engine-simple-settings" role="tabpanel">
-                  <header><p className="eyebrow">处理引擎</p><h2>FFmpeg 处理设置</h2><p>仅在 yt-dlp 合并或转码媒体时生效。</p></header>
+                  <header><p className="eyebrow">媒体处理</p><h2>媒体处理设置</h2><p>用于合并或转换下载后的媒体文件。</p></header>
                   <div className="friendly-form">
                     <div className="friendly-control-row"><span><b>网页播放优化</b><small>优化 MP4 文件在网页中的起播速度。</small></span><SettingSelect ariaLabel="网页播放优化" value={configOptionValue(settingsDraft.ffmpeg_config, '-movflags')} options={[{ value: '', label: '自动' }, { value: '+faststart', label: '开启' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, ffmpeg_config: updateConfigOption(settingsDraft.ffmpeg_config, '-movflags', value) })} /></div>
                     <div className="friendly-control-row"><span><b>视频编码</b><small>需要兼容更多播放器时可转换为 H.264。</small></span><SettingSelect ariaLabel="视频编码" value={configOptionValue(settingsDraft.ffmpeg_config, '-c:v')} options={[{ value: '', label: '保持原编码' }, { value: 'libx264', label: 'H.264' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, ffmpeg_config: updateConfigOption(settingsDraft.ffmpeg_config, '-c:v', value) })} /></div>
@@ -4231,29 +4317,29 @@ export default function App() {
                     <div className="friendly-control-row"><span><b>音频比特率</b><small>仅在音频转换为 AAC 时使用。</small></span><SettingSelect ariaLabel="音频比特率" value={configOptionValue(settingsDraft.ffmpeg_config, '-b:a')} options={[{ value: '', label: '自动' }, { value: '128k', label: '128 kbps' }, { value: '192k', label: '192 kbps' }, { value: '256k', label: '256 kbps' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, ffmpeg_config: updateConfigOption(settingsDraft.ffmpeg_config, '-b:a', value) })} /></div>
                     <div className="friendly-control-row"><span><b>音频采样率</b><small>没有兼容问题时保持自动。</small></span><SettingSelect ariaLabel="音频采样率" value={configOptionValue(settingsDraft.ffmpeg_config, '-ar')} options={[{ value: '', label: '自动' }, { value: '44100', label: '44.1 kHz' }, { value: '48000', label: '48 kHz' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, ffmpeg_config: updateConfigOption(settingsDraft.ffmpeg_config, '-ar', value) })} /></div>
                   </div>
-                  <footer className="tab-save-footer">{settingsNotice ? <p className="settings-notice" role="status">{settingsNotice}</p> : <span>仅保存 FFmpeg 处理设置。</span>}<button className="primary-button" type="button" onClick={() => saveSettings('ffmpeg')} disabled={savingSettings !== null}>{savingSettings === 'ffmpeg' ? '正在保存…' : '保存 FFmpeg 设置'}</button></footer>
+                  <footer className="tab-save-footer">{settingsNotice ? <p className="settings-notice" role="status">{settingsNotice}</p> : <span>仅保存媒体处理设置。</span>}<button className="primary-button" type="button" onClick={() => saveSettings('ffmpeg')} disabled={savingSettings !== null}>{savingSettings === 'ffmpeg' ? '正在保存…' : '保存媒体处理设置'}</button></footer>
                 </section>}
 
                 {settingsTab === 'aria2' && <section className="general-settings aria2-settings" role="tabpanel">
-                  <header><p className="eyebrow">下载引擎</p><h2>aria2 下载设置</h2><p>仅影响直链、迅雷链接和 BT 下载。</p></header>
+                  <header><p className="eyebrow">直链与 BT</p><h2>直链与 BT 下载</h2><p>仅影响直链、迅雷链接和 BT 下载。</p></header>
                   <div className="friendly-form">
                     <div className="friendly-control-row"><span><b>直链分片数</b><small>同一文件使用的并行连接数；网络不稳定时可降低。</small></span><SettingSelect ariaLabel="直链分片数" value={settingsDraft.aria2.split} options={[{ value: '1', label: '1 个' }, { value: '2', label: '2 个' }, { value: '5', label: '5 个' }, { value: '8', label: '8 个' }, { value: '16', label: '16 个' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, aria2: { ...settingsDraft.aria2, split: Number(value) } })} /></div>
-                    <div className="friendly-control-row"><span><b>失败重试次数</b><small>直链下载遇到临时网络错误时的重试次数。</small></span><SettingSelect ariaLabel="aria2 失败重试次数" value={settingsDraft.aria2.max_tries} options={[{ value: '1', label: '1 次' }, { value: '3', label: '3 次' }, { value: '5', label: '5 次' }, { value: '10', label: '10 次' }, { value: '20', label: '20 次' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, aria2: { ...settingsDraft.aria2, max_tries: Number(value) } })} /></div>
+                    <div className="friendly-control-row"><span><b>失败重试次数</b><small>直链下载遇到临时网络错误时的重试次数。</small></span><SettingSelect ariaLabel="失败重试次数" value={settingsDraft.aria2.max_tries} options={[{ value: '1', label: '1 次' }, { value: '3', label: '3 次' }, { value: '5', label: '5 次' }, { value: '10', label: '10 次' }, { value: '20', label: '20 次' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, aria2: { ...settingsDraft.aria2, max_tries: Number(value) } })} /></div>
                     <div className="friendly-control-row"><span><b>重试间隔</b><small>每次重试前等待的时间。</small></span><SettingSelect ariaLabel="重试间隔" value={settingsDraft.aria2.retry_wait} options={[{ value: '0', label: '立即重试' }, { value: '2', label: '2 秒' }, { value: '5', label: '5 秒' }, { value: '10', label: '10 秒' }, { value: '30', label: '30 秒' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, aria2: { ...settingsDraft.aria2, retry_wait: Number(value) } })} /></div>
                     <div className="friendly-control-row"><span><b>BT 无数据超时</b><small>在这段时间内没有获得任何数据时停止任务并提示重试。</small></span><SettingSelect ariaLabel="BT 无数据超时" value={settingsDraft.aria2.bt_stall_timeout} options={[{ value: '30', label: '30 秒' }, { value: '60', label: '60 秒' }, { value: '90', label: '90 秒' }, { value: '180', label: '3 分钟' }, { value: '300', label: '5 分钟' }, { value: '600', label: '10 分钟' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, aria2: { ...settingsDraft.aria2, bt_stall_timeout: Number(value) } })} /></div>
                   </div>
-                  <footer className="tab-save-footer">{settingsNotice ? <p className="settings-notice" role="status">{settingsNotice}</p> : <span>仅保存 aria2 下载设置。</span>}<button className="primary-button" type="button" onClick={() => saveSettings('aria2')} disabled={savingSettings !== null}>{savingSettings === 'aria2' ? '正在保存…' : '保存 aria2 设置'}</button></footer>
+                  <footer className="tab-save-footer">{settingsNotice ? <p className="settings-notice" role="status">{settingsNotice}</p> : <span>仅保存直链与 BT 下载设置。</span>}<button className="primary-button" type="button" onClick={() => saveSettings('aria2')} disabled={savingSettings !== null}>{savingSettings === 'aria2' ? '正在保存…' : '保存直链与 BT 设置'}</button></footer>
                 </section>}
 
                 {settingsTab === 'qbittorrent' && <section className="general-settings aria2-settings" role="tabpanel">
-                  <header><p className="eyebrow">可选 BT 引擎</p><h2>qBittorrent 连接</h2><p>启用后，磁力链接和种子文件会优先交给 qBittorrent；网页视频和直链仍使用原下载引擎。</p></header>
+                  <header><p className="eyebrow">BT 客户端</p><h2>BT 客户端连接</h2><p>启用后，磁力链接和种子文件会优先交给已连接的 BT 客户端。</p></header>
                   <div className="friendly-form">
-                    <label className="friendly-switch"><span><b>启用 qBittorrent</b><small>保存时会立即验证 Web UI 连接和登录信息。</small></span><input type="checkbox" checked={settingsDraft.qbittorrent.enabled} onChange={(event) => setSettingsDraft({ ...settingsDraft, qbittorrent: { ...settingsDraft.qbittorrent, enabled: event.target.checked } })} /></label>
-                    <label><span><b>Web UI 地址</b><small>必须是本机或局域网内可访问的完整 HTTP(S) 地址。</small></span><input value={settingsDraft.qbittorrent.base_url} onChange={(event) => setSettingsDraft({ ...settingsDraft, qbittorrent: { ...settingsDraft.qbittorrent, base_url: event.target.value } })} placeholder="http://127.0.0.1:8080" /></label>
-                    <label><span><b>用户名</b><small>qBittorrent Web UI 登录用户名。</small></span><input value={settingsDraft.qbittorrent.username} onChange={(event) => setSettingsDraft({ ...settingsDraft, qbittorrent: { ...settingsDraft.qbittorrent, username: event.target.value } })} autoComplete="username" /></label>
+                    <label className="friendly-switch"><span><b>启用 BT 客户端</b><small>保存时会立即验证本地 Web UI 连接和登录信息。</small></span><input type="checkbox" checked={settingsDraft.qbittorrent.enabled} onChange={(event) => setSettingsDraft({ ...settingsDraft, qbittorrent: { ...settingsDraft.qbittorrent, enabled: event.target.checked } })} /></label>
+                    <label><span><b>BT 客户端地址</b><small>必须是本机或局域网内可访问的完整 HTTP(S) 地址。</small></span><input value={settingsDraft.qbittorrent.base_url} onChange={(event) => setSettingsDraft({ ...settingsDraft, qbittorrent: { ...settingsDraft.qbittorrent, base_url: event.target.value } })} placeholder="http://127.0.0.1:8080" /></label>
+                    <label><span><b>用户名</b><small>BT 客户端 Web UI 登录用户名。</small></span><input value={settingsDraft.qbittorrent.username} onChange={(event) => setSettingsDraft({ ...settingsDraft, qbittorrent: { ...settingsDraft.qbittorrent, username: event.target.value } })} autoComplete="username" /></label>
                     <label><span><b>密码</b><small>仅保存在本机应用数据库中，不会写入下载日志。</small></span><input type="password" value={settingsDraft.qbittorrent.password} onChange={(event) => setSettingsDraft({ ...settingsDraft, qbittorrent: { ...settingsDraft.qbittorrent, password: event.target.value } })} autoComplete="current-password" /></label>
-                    <div className="friendly-control-row"><span><b>BT 无数据超时</b><small>没有取得元数据或下载进度时停止并给出错误。</small></span><SettingSelect ariaLabel="qBittorrent BT 无数据超时" value={settingsDraft.qbittorrent.bt_stall_timeout} options={[{ value: '30', label: '30 秒' }, { value: '60', label: '60 秒' }, { value: '90', label: '90 秒' }, { value: '180', label: '3 分钟' }, { value: '300', label: '5 分钟' }, { value: '600', label: '10 分钟' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, qbittorrent: { ...settingsDraft.qbittorrent, bt_stall_timeout: Number(value) } })} /></div>
-                    <p className="input-help">qBittorrent 进程必须能读写与本应用相同的下载绝对路径；远程主机或容器需把该路径映射为同一路径。</p>
+                    <div className="friendly-control-row"><span><b>BT 无数据超时</b><small>没有取得元数据或下载进度时停止并给出错误。</small></span><SettingSelect ariaLabel="BT 无数据超时" value={settingsDraft.qbittorrent.bt_stall_timeout} options={[{ value: '30', label: '30 秒' }, { value: '60', label: '60 秒' }, { value: '90', label: '90 秒' }, { value: '180', label: '3 分钟' }, { value: '300', label: '5 分钟' }, { value: '600', label: '10 分钟' }]} onChange={(value) => setSettingsDraft({ ...settingsDraft, qbittorrent: { ...settingsDraft.qbittorrent, bt_stall_timeout: Number(value) } })} /></div>
+                    <p className="input-help">BT 客户端必须能读写与本应用相同的下载路径；远程主机或容器需把该路径映射为同一路径。</p>
                   </div>
                   <footer className="tab-save-footer">{settingsNotice ? <p className="settings-notice" role="status">{settingsNotice}</p> : <span>启用时会测试连接；关闭时仅保存配置。</span>}<button className="primary-button" type="button" onClick={() => saveSettings('qbittorrent')} disabled={savingSettings !== null}>{savingSettings === 'qbittorrent' ? '正在连接…' : '保存并测试连接'}</button></footer>
                 </section>}
@@ -4261,7 +4347,7 @@ export default function App() {
                 {settingsTab === 'backup' && <section className="general-settings maintenance-settings backup-settings" role="tabpanel">
                   <header><p className="eyebrow">本地数据</p><h2>备份与恢复</h2><p>备份收藏、观看进度、媒体记录、下载任务和所有设置；不会复制或移动视频与音频文件。</p></header>
                   <section className="maintenance-card">
-                    <div><h3>导出备份</h3><p>生成带格式版本和应用版本信息的 JSON 文件。配置中可能包含 qBittorrent 密码，请保存在可信位置。</p></div>
+                    <div><h3>导出备份</h3><p>生成带格式版本和应用版本信息的 JSON 文件。配置中可能包含 BT 客户端密码，请保存在可信位置。</p></div>
                     <div className="maintenance-card-actions"><a className="primary-button" href={`${apiBase}/api/v1/backup/export`} download>下载备份文件</a></div>
                   </section>
                   <section className="maintenance-card backup-restore-card">
@@ -4290,7 +4376,7 @@ export default function App() {
                     <div className="maintenance-card-actions"><button className="cancel-button" type="button" onClick={() => void refreshMaintenanceData()} disabled={maintenanceWorking}>{maintenanceWorking ? '扫描中…' : '重新扫描'}</button><button className="delete-button" type="button" onClick={() => void runHistoryCleanup()} disabled={maintenanceWorking || !maintenancePreview || (!settingsDraft.maintenance.clean_download_logs && !settingsDraft.maintenance.clean_download_tasks) || ((settingsDraft.maintenance.clean_download_logs ? maintenancePreview.log_count : 0) + (settingsDraft.maintenance.clean_download_tasks ? maintenancePreview.task_count : 0) === 0)}>立即清理历史记录</button></div>
                   </section>
                   <section className="maintenance-card residue-card">
-                    <div><h3>未完成文件</h3><p>{incompletePreview ? `发现 ${incompletePreview.total_items} 项，共约 ${incompletePreview.total_bytes === 0 ? '0 B' : fileSizeLabel(incompletePreview.total_bytes)}。勾选后移入 macOS 废纸篓。` : '扫描 .part、.ytdl、.aria2、BT 临时目录和种子缓存。'}</p></div>
+                    <div><h3>未完成文件</h3><p>{incompletePreview ? `发现 ${incompletePreview.total_items} 项，共约 ${incompletePreview.total_bytes === 0 ? '0 B' : fileSizeLabel(incompletePreview.total_bytes)}。勾选后移入 macOS 废纸篓。` : '扫描未完成下载临时文件、BT 临时目录和种子缓存。'}</p></div>
                     {incompletePreview && incompletePreview.items.length > 0 && <><label className="maintenance-select-all"><input type="checkbox" checked={selectedResiduePaths.length === incompletePreview.items.length} onChange={(event) => setSelectedResiduePaths(event.target.checked ? incompletePreview.items.map((item) => item.path) : [])} />全选 {incompletePreview.items.length} 项</label><ol className="residue-list">{incompletePreview.items.map((item) => <li key={item.path}><label><input type="checkbox" checked={selectedResiduePaths.includes(item.path)} onChange={(event) => setSelectedResiduePaths((current) => event.target.checked ? [...current, item.path] : current.filter((path) => path !== item.path))} /><span><b>{item.kind} · {item.title}</b><small>{item.path} · {fileSizeLabel(item.size)} · {item.status === 'paused' ? '已暂停，可继续下载' : item.task_deleted ? '任务记录已清理' : statusLabel(item.status)}</small></span></label></li>)}</ol></>}
                     <div className="maintenance-card-actions"><button className="delete-button" type="button" onClick={() => void cleanupSelectedResidues()} disabled={maintenanceWorking || selectedResiduePaths.length === 0}>将已选 {selectedResiduePaths.length} 项移入废纸篓</button></div>
                   </section>
@@ -4466,8 +4552,8 @@ export default function App() {
                   {media.kind === 'video' ? <>
                     <div className="media-facts"><span>{durationLabel(media.duration)}</span><span>{media.resolution || '视频'}</span><span>{dateLabel(media.upload_date)}</span></div>
                     <div className="format-picker">
-                      <label htmlFor="format">下载格式</label>
-                      <select id="format" value={selectedFormat || ''} onChange={(event) => setSelectedFormat(event.target.value || null)}>{media.formats.length === 0 && <option value="">自动选择最佳格式</option>}{media.formats.map((format) => <option key={format.format_id} value={format.format_id}>{format.label}{format.file_size_label ? ` · ${format.file_size_label}` : ''}</option>)}</select>
+                      <label>下载格式</label>
+                      <DownloadFormatPicker formats={media.formats} value={selectedFormat} onChange={setSelectedFormat} />
                       <button type="button" className="primary-button" onClick={() => void createDownload()} disabled={working}>开始下载</button>
                     </div>
                   </> : <>
@@ -4486,9 +4572,9 @@ export default function App() {
                 </div>
               </div>
             )}
-            {media?.kind === 'file' && <div className="engine-inspect-result"><p className="media-source">{media.source_type === 'thunder' ? '迅雷链接 · 已转为直链' : '直链文件'} · aria2</p><h3>{media.title}</h3><div className="media-facts"><span>{fileSizeLabel(media.file_size)}</span><span>{media.content_type || '文件类型未知'}</span><span>{media.resolved_host || '目标地址未返回主机'}</span></div><p>{media.message}</p><button type="button" className="primary-button" onClick={() => void createDownload()} disabled={working}>使用 aria2 下载</button></div>}
+            {media?.kind === 'file' && <div className="engine-inspect-result"><p className="media-source">{media.source_type === 'thunder' ? '迅雷链接 · 已转为直链' : '直链文件'}</p><h3>{media.title}</h3><div className="media-facts"><span>{fileSizeLabel(media.file_size)}</span><span>{media.content_type || '文件类型未知'}</span><span>{media.resolved_host || '目标地址未返回主机'}</span></div><p>{media.message}</p><button type="button" className="primary-button" onClick={() => void createDownload()} disabled={working}>开始下载</button></div>}
             {media?.kind === 'torrent' && <div className="engine-inspect-result">
-              <p className="media-source">BT 下载 · {media.engine === 'qbittorrent' ? 'qBittorrent' : 'aria2'}</p>
+              <p className="media-source">BT 下载</p>
               <h3>{media.title}</h3>
               <div className="media-facts"><span>{media.source_type === 'magnet' ? '磁力链接' : media.source_type === 'torrent_file' ? '种子文件' : media.source_type === 'thunder_bt' ? '迅雷 BT 链接' : '种子地址'}</span><span>{`${torrentMediaFiles.length} 个视频或音频`}</span><span>{fileSizeLabel(torrentMediaSize)}</span></div>
               {media.message && <p>{media.message}</p>}
@@ -4515,7 +4601,7 @@ export default function App() {
                   </div>
                   {filteredTorrentMediaFiles.length > torrentVisibleFileCount && <footer className="torrent-list-footer"><span>已显示 {torrentVisibleFileCount} / {filteredTorrentMediaFiles.length} 个匹配文件</span><button type="button" onClick={() => setTorrentVisibleFileCount((count) => count + torrentVisibleFileStep)}>显示更多</button></footer>}
                 </section>
-                <p className="input-help">仅下载已选视频或音频；{media.engine === 'qbittorrent' ? 'qBittorrent' : 'aria2'} 会继续连接可用节点或 Web Seed。</p>
+                <p className="input-help">仅下载已选视频或音频；应用会继续连接可用节点或 Web Seed。</p>
               </> : torrentMediaFiles.length === 1 ? <p className="input-help">已排除非音视频文件，仅下载这个媒体文件。</p> : <p className="notice">种子中没有可下载的视频或音频文件。</p>}
               <button type="button" className="primary-button" onClick={() => void createDownload()} disabled={working || torrentMediaFiles.length === 0 || selectedTorrentFileIndexes.length === 0}>{torrentMediaFiles.length > 1 ? (selectedTorrentFileIndexes.length === torrentMediaFiles.length ? `下载全部 ${torrentMediaFiles.length} 个媒体文件` : `下载已选 ${selectedTorrentFileIndexes.length} 个媒体文件`) : torrentMediaFiles.length === 1 ? `下载 ${torrentMediaFiles[0].path}` : '没有可下载的视频或音频'}</button>
             </div>}
@@ -4626,7 +4712,7 @@ export default function App() {
 
       {playerVideo && (
         <div className="modal-backdrop player-backdrop" onMouseDown={() => setPlayerVideo(null)}>
-          <section className={`player-modal${currentPlayerMediaType === 'audio' ? ' is-audio' : ''}`} role="dialog" aria-modal="true" aria-labelledby="player-title" onMouseDown={(event) => event.stopPropagation()}>
+          <section className={`player-modal${currentPlayerMediaType === 'audio' ? ' is-audio' : ''}${playerFullscreen ? ' is-fullscreen' : ''}`} role="dialog" aria-modal="true" aria-labelledby="player-title" onMouseDown={(event) => event.stopPropagation()}>
             <header>
               <div><p className="eyebrow">{currentPlayerMediaType === 'audio' ? '音频播放器' : '本地播放器'}</p><h2 id="player-title">{playerVideo.title || `未命名${currentPlayerMediaType === 'audio' ? '音频' : '视频'}`}</h2><p>{sourceLabel(playerVideo)} · {durationLabel(playerVideo.duration)} · {libraryResolutionLabel({ kind: 'video', ...playerVideo })}</p></div>
               <button className="icon-button" onClick={() => setPlayerVideo(null)} aria-label="关闭播放器"><Icon name="close" /></button>
@@ -4813,6 +4899,22 @@ export default function App() {
             <footer>
               <button className="cancel-button" onClick={() => setVideoToDelete(null)} disabled={deletingVideo}>取消</button>
               <button className="delete-button" onClick={deleteVideo} disabled={deletingVideo || (removeVideoFile && (deletePreviewLoading || deletePreview.length === 0))}>{deletingVideo ? (removeVideoFile ? '正在移入废纸篓…' : '正在删除记录…') : (removeVideoFile ? '移入废纸篓并删除记录' : '仅删除记录')}</button>
+            </footer>
+          </section>
+        </div>
+      )}
+
+      {collectionToDelete && (
+        <div className="modal-backdrop" onMouseDown={() => { if (!deletingCollection) setCollectionToDelete(null) }}>
+          <section className="delete-modal" role="dialog" aria-modal="true" aria-labelledby="delete-collection-title" onMouseDown={(event) => event.stopPropagation()}>
+            <p className="eyebrow">删除合集</p>
+            <h2 id="delete-collection-title">删除“{collectionToDelete.title || '未命名合集'}”？</h2>
+            <p>{removeCollectionFiles ? '将删除合集及其下全部视频和任务记录，并把已下载的本地视频及关联文件移入 macOS 废纸篓。' : '将删除合集及其下全部视频和任务记录；本地文件保持原样。'}</p>
+            <label className="delete-file-option"><input type="checkbox" checked={removeCollectionFiles} onChange={(event) => setRemoveCollectionFiles(event.target.checked)} /><span><b>同时删除本地文件</b><small>已下载的视频及关联字幕、封面和 info JSON 会移入 macOS 废纸篓。</small></span></label>
+            {collectionDeleteNotice && <p className="notice" role="status">{collectionDeleteNotice}</p>}
+            <footer>
+              <button className="cancel-button" onClick={() => setCollectionToDelete(null)} disabled={deletingCollection}>取消</button>
+              <button className="delete-button" onClick={() => void deletePlaylist()} disabled={deletingCollection}>{deletingCollection ? '正在删除…' : '删除合集'}</button>
             </footer>
           </section>
         </div>

@@ -38,6 +38,9 @@ frontend/dist/
 # Generated build and test artifacts
 /.build/
 /dist/
+/desktop/runtime/
+/desktop/tauri/resources/
+/desktop/tauri/target/
 /output/
 /.playwright-cli/
 /design-qa.md

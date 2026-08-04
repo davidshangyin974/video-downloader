@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install install-backend install-frontend dev-backend dev-frontend build check test test-fuzz test-coverage run macos-app
+.PHONY: help install install-backend install-frontend install-desktop-tools dev-backend dev-frontend build check test test-fuzz test-coverage run macos-app prepare-macos-runtime tauri-sidecar tauri-macos tauri-windows
 
 help:
 	@echo "make install           安装前后端依赖"
@@ -13,6 +13,8 @@ help:
 	@echo "make test-coverage     运行测试并执行关键代码 98% 覆盖率门禁"
 	@echo "make run               构建并启动个人视频工具"
 	@echo "make macos-app         构建可双击启动的 macOS 应用"
+	@echo "make tauri-macos       构建可分发的 Apple Silicon DMG（需签名配置）"
+	@echo "make tauri-windows     在 Windows 构建 x64 安装程序"
 
 install: install-backend install-frontend
 
@@ -21,6 +23,10 @@ install-backend:
 	backend/.venv/bin/pip install -e 'backend[test]'
 
 install-frontend:
+	npm --prefix frontend install
+
+install-desktop-tools:
+	backend/.venv/bin/pip install 'pyinstaller>=6.16,<7'
 	npm --prefix frontend install
 
 dev-backend:
@@ -61,3 +67,17 @@ macos-app:
 	npm --prefix frontend run build
 	chmod +x scripts/build_macos_app.sh
 	./scripts/build_macos_app.sh
+
+prepare-macos-runtime:
+	chmod +x scripts/prepare_macos_runtime.sh
+	./scripts/prepare_macos_runtime.sh
+
+tauri-sidecar:
+	backend/.venv/bin/python scripts/build_tauri_sidecar.py
+
+tauri-macos: prepare-macos-runtime tauri-sidecar
+	chmod +x scripts/build_tauri_macos_dmg.sh
+	./scripts/build_tauri_macos_dmg.sh
+
+tauri-windows: tauri-sidecar
+	npm --prefix frontend run tauri:build
