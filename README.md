@@ -176,6 +176,10 @@ ffmpeg -version
 3. 运行与修改直接相关的测试；涉及前端时同时运行 `make check` 和 `make build`。
 4. 不提交媒体文件、Cookie、账号信息、下载记录、数据库或其他私密数据。
 
+## 许可证
+
+本项目源代码采用 [Apache License 2.0](LICENSE) 发布。第三方组件仍遵循各自的许可证和分发要求。
+
 ## 第三方软件与使用边界
 
 本项目是 `yt-dlp`、aria2、FFmpeg 等开源工具的本地界面与任务管理层。完整依赖和许可证记录见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，各项目的著作权与许可证仍归原权利人。
